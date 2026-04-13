@@ -1,0 +1,1042 @@
+﻿
+#include <Bluepad32.h>
+#include <ESP32Servo.h>
+#include <Preferences.h>
+#include <WebServer.h>
+#include <WiFi.h>
+
+namespace {
+constexpr uint32_t SERIAL_BAUD = 115200;
+constexpr uint32_t CONTROL_INTERVAL_MS = 20;
+constexpr uint32_t WIFI_RETRY_MS = 12000;
+constexpr int ANALOG_DEADZONE = 24;
+constexpr int AXIS_MAX_MAGNITUDE = 512;
+constexpr int TRIGGER_MAX_MAGNITUDE = 1023;
+constexpr int GRIPPER_MIN_LIMIT = 20;
+constexpr int GRIPPER_MAX_LIMIT = 160;
+
+const char* DEFAULT_AP_SSID = "RobotArm-Setup";
+const char* DEFAULT_AP_PASSWORD = "robotarm123";
+const char* DEFAULT_HOSTNAME = "robot-arm";
+
+enum JointIndex {
+  BASE = 0,
+  SHOULDER,
+  ELBOW,
+  WRIST_PITCH,
+  WRIST_ROTATE,
+  GRIPPER,
+  JOINT_COUNT
+};
+
+enum ControlMode {
+  CONTROL_NONE = 0,
+  CONTROL_AXIS = 1,
+  CONTROL_BUTTONS = 2
+};
+
+enum MotorType {
+  MOTOR_POSITIONAL = 0,
+  MOTOR_CONTINUOUS = 1
+};
+
+enum AxisSource {
+  AXIS_NONE = 0,
+  AXIS_LX = 1,
+  AXIS_LY = 2,
+  AXIS_RX = 3,
+  AXIS_RY = 4,
+  AXIS_DPAD_X = 5,
+  AXIS_DPAD_Y = 6,
+  AXIS_TRIGGERS = 7
+};
+
+enum ButtonSource {
+  BTN_NONE = 0,
+  BTN_UP = 1,
+  BTN_DOWN = 2,
+  BTN_LEFT = 3,
+  BTN_RIGHT = 4,
+  BTN_SQUARE = 5,
+  BTN_CROSS = 6,
+  BTN_CIRCLE = 7,
+  BTN_TRIANGLE = 8,
+  BTN_L1 = 9,
+  BTN_R1 = 10,
+  BTN_L2 = 11,
+  BTN_R2 = 12,
+  BTN_SHARE = 13,
+  BTN_OPTIONS = 14,
+  BTN_L3 = 15,
+  BTN_R3 = 16,
+  BTN_PS = 17,
+  BTN_TOUCHPAD = 18
+};
+
+struct Joint {
+  const char* name;
+  const char* key;
+  Servo servo;
+  uint8_t pin;
+  uint8_t motorType;
+  int minAngle;
+  int maxAngle;
+  int homeAngle;
+  int step;
+  int pulseMin;
+  int pulseMax;
+  bool inverted;
+  int position;
+  int velocity;
+  bool attached;
+  uint8_t controlMode;
+  uint8_t axisSource;
+  uint8_t positiveButton;
+  uint8_t negativeButton;
+  bool inputInvert;
+};
+
+struct ControllerSettings {
+  bool enabled = true;
+  bool allowNewConnections = true;
+  uint8_t ledR = 0;
+  uint8_t ledG = 0;
+  uint8_t ledB = 255;
+  uint8_t rumbleForce = 0;
+  uint8_t rumbleDuration = 0;
+};
+
+struct WifiSettings {
+  String staSsid = "";
+  String staPassword = "";
+  String apSsid = DEFAULT_AP_SSID;
+  String apPassword = DEFAULT_AP_PASSWORD;
+  String hostname = DEFAULT_HOSTNAME;
+};
+
+struct ConnectedControllerInfo {
+  bool connected = false;
+  String modelName = "";
+  String typeName = "";
+  String btAddress = "";
+  uint8_t battery = 0;
+};
+
+Joint joints[JOINT_COUNT] = {
+  {"base",         "bas", Servo(), 18, MOTOR_POSITIONAL, 0,   180, 90, 2, 500, 2400, false, 90, 0, false, CONTROL_AXIS, AXIS_LX, BTN_NONE, BTN_NONE, false},
+  {"shoulder",     "sho", Servo(), 19, MOTOR_POSITIONAL, 0,   180, 90, 2, 500, 2400, false, 90, 0, false, CONTROL_AXIS, AXIS_LY, BTN_NONE, BTN_NONE, true},
+  {"elbow",        "elb", Servo(), 23, MOTOR_POSITIONAL, 0,   180, 90, 2, 500, 2400, false, 90, 0, false, CONTROL_AXIS, AXIS_RX, BTN_NONE, BTN_NONE, false},
+  {"wrist_pitch",  "wpi", Servo(), 21, MOTOR_POSITIONAL, 0,   180, 90, 2, 500, 2400, false, 90, 0, false, CONTROL_AXIS, AXIS_RY, BTN_NONE, BTN_NONE, true},
+  {"wrist_rotate", "wro", Servo(), 22, MOTOR_POSITIONAL, 0,   180, 90, 2, 500, 2400, false, 90, 0, false, CONTROL_BUTTONS, AXIS_NONE, BTN_UP, BTN_DOWN, false},
+  {"gripper",      "gri", Servo(), 25, MOTOR_POSITIONAL, 20,  160, 90, 2, 500, 2400, false, 90, 0, false, CONTROL_BUTTONS, AXIS_NONE, BTN_CIRCLE, BTN_CROSS, false},
+};
+
+Preferences preferences;
+ControllerSettings controllerSettings;
+WifiSettings wifiSettings;
+ConnectedControllerInfo connectedInfo;
+WebServer server(80);
+ControllerPtr connectedControllers[BP32_MAX_GAMEPADS];
+ControllerPtr activeController = nullptr;
+String localBluetoothMac = "";
+uint32_t lastControlTick = 0;
+bool wifiReconnectRequested = false;
+bool rebootRequested = false;
+
+String prefKey(const Joint& joint, const char* suffix) {
+  return String(joint.key) + suffix;
+}
+
+String jsonQuote(const String& value) {
+  String escaped = "\"";
+  for (int i = 0; i < value.length(); ++i) {
+    char c = value[i];
+    if (c == '\\' || c == '"') {
+      escaped += '\\';
+      escaped += c;
+    } else if (c == '\n') {
+      escaped += "\\n";
+    } else if (c == '\r') {
+      escaped += "\\r";
+    } else if (c == '\t') {
+      escaped += "\\t";
+    } else {
+      escaped += c;
+    }
+  }
+  escaped += '"';
+  return escaped;
+}
+
+String boolJson(bool value) {
+  return value ? "true" : "false";
+}
+
+String htmlEscape(const String& value) {
+  String escaped;
+  escaped.reserve(value.length() + 16);
+  for (int i = 0; i < value.length(); ++i) {
+    char c = value[i];
+    if (c == '&') escaped += "&amp;";
+    else if (c == '<') escaped += "&lt;";
+    else if (c == '>') escaped += "&gt;";
+    else if (c == '"') escaped += "&quot;";
+    else escaped += c;
+  }
+  return escaped;
+}
+
+String formatBdAddress(const uint8_t* addr) {
+  if (addr == nullptr) {
+    return "";
+  }
+  char buffer[18];
+  snprintf(buffer, sizeof(buffer), "%02x:%02x:%02x:%02x:%02x:%02x",
+           addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
+  return String(buffer);
+}
+
+const char* controllerTypeName(int type) {
+  switch (type) {
+    case Controller::CONTROLLER_TYPE_PS4Controller: return "ps4";
+    case Controller::CONTROLLER_TYPE_PS5Controller: return "ps5";
+    case Controller::CONTROLLER_TYPE_XBoxOneController: return "xbox_one";
+    case Controller::CONTROLLER_TYPE_XBox360Controller: return "xbox_360";
+    case Controller::CONTROLLER_TYPE_SwitchProController: return "switch_pro";
+    case Controller::CONTROLLER_TYPE_SwitchJoyConLeft: return "joycon_left";
+    case Controller::CONTROLLER_TYPE_SwitchJoyConRight: return "joycon_right";
+    case Controller::CONTROLLER_TYPE_SwitchJoyConPair: return "joycon_pair";
+    case Controller::CONTROLLER_TYPE_PS3Controller: return "ps3";
+    default: return "generic";
+  }
+}
+
+const char* controlModeName(uint8_t value) {
+  switch (value) {
+    case CONTROL_AXIS: return "axis";
+    case CONTROL_BUTTONS: return "buttons";
+    default: return "none";
+  }
+}
+
+const char* motorTypeName(uint8_t value) {
+  switch (value) {
+    case MOTOR_CONTINUOUS: return "continuous_360";
+    default: return "positional_180";
+  }
+}
+
+const char* axisSourceName(uint8_t value) {
+  switch (value) {
+    case AXIS_LX: return "left_stick_x";
+    case AXIS_LY: return "left_stick_y";
+    case AXIS_RX: return "right_stick_x";
+    case AXIS_RY: return "right_stick_y";
+    case AXIS_DPAD_X: return "dpad_x";
+    case AXIS_DPAD_Y: return "dpad_y";
+    case AXIS_TRIGGERS: return "triggers";
+    default: return "none";
+  }
+}
+
+const char* buttonSourceName(uint8_t value) {
+  switch (value) {
+    case BTN_UP: return "up";
+    case BTN_DOWN: return "down";
+    case BTN_LEFT: return "left";
+    case BTN_RIGHT: return "right";
+    case BTN_SQUARE: return "square";
+    case BTN_CROSS: return "cross";
+    case BTN_CIRCLE: return "circle";
+    case BTN_TRIANGLE: return "triangle";
+    case BTN_L1: return "l1";
+    case BTN_R1: return "r1";
+    case BTN_L2: return "l2";
+    case BTN_R2: return "r2";
+    case BTN_SHARE: return "share";
+    case BTN_OPTIONS: return "options";
+    case BTN_L3: return "l3";
+    case BTN_R3: return "r3";
+    case BTN_PS: return "ps";
+    case BTN_TOUCHPAD: return "touchpad";
+    default: return "none";
+  }
+}
+
+void sendOk(const String& extra = "{}") {
+  server.send(200, "application/json", "{\"ok\":true,\"result\":" + extra + "}");
+}
+
+void sendError(const String& message, int code = 400) {
+  server.send(code, "application/json", "{\"ok\":false,\"error\":" + jsonQuote(message) + "}");
+}
+
+int clampAngle(const Joint& joint, int value) {
+  if (joint.motorType == MOTOR_CONTINUOUS) {
+    return constrain(value, joint.minAngle, joint.maxAngle);
+  }
+  return constrain(value, joint.minAngle, joint.maxAngle);
+}
+
+int applyDirection(const Joint& joint, int value) {
+  if (joint.motorType == MOTOR_CONTINUOUS) {
+    int speed = joint.inverted ? -value : value;
+    return map(speed, -100, 100, 0, 180);
+  }
+  return joint.inverted ? (180 - value) : value;
+}
+
+int axisToCommand(const Joint& joint, int value, int maxMagnitude, bool invertInput) {
+  int signedValue = invertInput ? -value : value;
+  int clamped = constrain(signedValue, -maxMagnitude, maxMagnitude);
+  if (joint.motorType == MOTOR_CONTINUOUS) {
+    if (abs(clamped) < ANALOG_DEADZONE) {
+      return 0;
+    }
+    return map(clamped, -maxMagnitude, maxMagnitude, joint.minAngle, joint.maxAngle);
+  }
+  int deadzoneApplied = abs(clamped) < ANALOG_DEADZONE ? 0 : clamped;
+  return map(deadzoneApplied, -maxMagnitude, maxMagnitude, joint.minAngle, joint.maxAngle);
+}
+
+void attachJoint(Joint& joint, bool reattach = false) {
+  if (joint.attached && !reattach) {
+    return;
+  }
+  if (joint.attached && reattach) {
+    joint.servo.detach();
+    joint.attached = false;
+  }
+  if (!joint.attached) {
+    joint.servo.setPeriodHertz(50);
+    joint.servo.attach(joint.pin, joint.pulseMin, joint.pulseMax);
+    joint.attached = true;
+  }
+}
+
+void detachJoint(Joint& joint) {
+  if (!joint.attached) {
+    return;
+  }
+  joint.servo.detach();
+  joint.attached = false;
+}
+
+void writeJoint(Joint& joint, int requestedPosition, bool forceAttach = true) {
+  joint.position = clampAngle(joint, requestedPosition);
+  if (forceAttach) {
+    attachJoint(joint);
+    joint.servo.write(applyDirection(joint, joint.position));
+  }
+}
+
+void writeAllJoints() {
+  for (int i = 0; i < JOINT_COUNT; ++i) {
+    writeJoint(joints[i], joints[i].position);
+  }
+}
+
+void saveJointSettings(const Joint& joint) {
+  preferences.putUChar(prefKey(joint, "_pin").c_str(), joint.pin);
+  preferences.putUChar(prefKey(joint, "_type").c_str(), joint.motorType);
+  preferences.putInt(prefKey(joint, "_min").c_str(), joint.minAngle);
+  preferences.putInt(prefKey(joint, "_max").c_str(), joint.maxAngle);
+  preferences.putInt(prefKey(joint, "_home").c_str(), joint.homeAngle);
+  preferences.putInt(prefKey(joint, "_step").c_str(), joint.step);
+  preferences.putInt(prefKey(joint, "_pmin").c_str(), joint.pulseMin);
+  preferences.putInt(prefKey(joint, "_pmax").c_str(), joint.pulseMax);
+  preferences.putBool(prefKey(joint, "_inv").c_str(), joint.inverted);
+  preferences.putInt(prefKey(joint, "_pos").c_str(), joint.position);
+  preferences.putUChar(prefKey(joint, "_cm").c_str(), joint.controlMode);
+  preferences.putUChar(prefKey(joint, "_ax").c_str(), joint.axisSource);
+  preferences.putUChar(prefKey(joint, "_pb").c_str(), joint.positiveButton);
+  preferences.putUChar(prefKey(joint, "_nb").c_str(), joint.negativeButton);
+  preferences.putBool(prefKey(joint, "_iinv").c_str(), joint.inputInvert);
+}
+
+void saveControllerSettings() {
+  preferences.putBool("ctl_enabled", controllerSettings.enabled);
+  preferences.putBool("ctl_pair", controllerSettings.allowNewConnections);
+  preferences.putUChar("ctl_led_r", controllerSettings.ledR);
+  preferences.putUChar("ctl_led_g", controllerSettings.ledG);
+  preferences.putUChar("ctl_led_b", controllerSettings.ledB);
+  preferences.putUChar("ctl_r_force", controllerSettings.rumbleForce);
+  preferences.putUChar("ctl_r_dur", controllerSettings.rumbleDuration);
+}
+
+void saveWifiSettings() {
+  preferences.putString("wifi_sta_ssid", wifiSettings.staSsid);
+  preferences.putString("wifi_sta_pw", wifiSettings.staPassword);
+  preferences.putString("wifi_ap_ssid", wifiSettings.apSsid);
+  preferences.putString("wifi_ap_pw", wifiSettings.apPassword);
+  preferences.putString("wifi_host", wifiSettings.hostname);
+}
+
+void saveAllSettings() {
+  for (int i = 0; i < JOINT_COUNT; ++i) {
+    saveJointSettings(joints[i]);
+  }
+  saveControllerSettings();
+  saveWifiSettings();
+}
+
+void loadJointSettings(Joint& joint) {
+  joint.pin = preferences.getUChar(prefKey(joint, "_pin").c_str(), joint.pin);
+  joint.motorType = preferences.getUChar(prefKey(joint, "_type").c_str(), joint.motorType);
+  joint.minAngle = preferences.getInt(prefKey(joint, "_min").c_str(), joint.minAngle);
+  joint.maxAngle = preferences.getInt(prefKey(joint, "_max").c_str(), joint.maxAngle);
+  joint.homeAngle = preferences.getInt(prefKey(joint, "_home").c_str(), joint.homeAngle);
+  joint.step = preferences.getInt(prefKey(joint, "_step").c_str(), joint.step);
+  joint.pulseMin = preferences.getInt(prefKey(joint, "_pmin").c_str(), joint.pulseMin);
+  joint.pulseMax = preferences.getInt(prefKey(joint, "_pmax").c_str(), joint.pulseMax);
+  joint.inverted = preferences.getBool(prefKey(joint, "_inv").c_str(), joint.inverted);
+  joint.position = preferences.getInt(prefKey(joint, "_pos").c_str(), joint.position);
+  joint.controlMode = preferences.getUChar(prefKey(joint, "_cm").c_str(), joint.controlMode);
+  joint.axisSource = preferences.getUChar(prefKey(joint, "_ax").c_str(), joint.axisSource);
+  joint.positiveButton = preferences.getUChar(prefKey(joint, "_pb").c_str(), joint.positiveButton);
+  joint.negativeButton = preferences.getUChar(prefKey(joint, "_nb").c_str(), joint.negativeButton);
+  joint.inputInvert = preferences.getBool(prefKey(joint, "_iinv").c_str(), joint.inputInvert);
+
+  joint.motorType = constrain(joint.motorType, MOTOR_POSITIONAL, MOTOR_CONTINUOUS);
+  int commandMin = joint.motorType == MOTOR_CONTINUOUS ? -100 : 0;
+  int commandMax = joint.motorType == MOTOR_CONTINUOUS ? 100 : 180;
+  joint.minAngle = constrain(joint.minAngle, commandMin, commandMax);
+  joint.maxAngle = constrain(joint.maxAngle, commandMin, commandMax);
+  if (joint.maxAngle < joint.minAngle) {
+    int swap = joint.minAngle;
+    joint.minAngle = joint.maxAngle;
+    joint.maxAngle = swap;
+  }
+  if (joint.motorType == MOTOR_CONTINUOUS && joint.homeAngle == 90) {
+    joint.homeAngle = 0;
+  }
+  joint.homeAngle = clampAngle(joint, joint.homeAngle);
+  joint.position = clampAngle(joint, joint.position);
+  joint.step = max(1, joint.step);
+  joint.pulseMin = max(100, joint.pulseMin);
+  joint.pulseMax = max(joint.pulseMin + 100, joint.pulseMax);
+  joint.controlMode = constrain(joint.controlMode, CONTROL_NONE, CONTROL_BUTTONS);
+  joint.axisSource = constrain(joint.axisSource, AXIS_NONE, AXIS_TRIGGERS);
+  joint.positiveButton = constrain(joint.positiveButton, BTN_NONE, BTN_TOUCHPAD);
+  joint.negativeButton = constrain(joint.negativeButton, BTN_NONE, BTN_TOUCHPAD);
+}
+
+void loadControllerSettings() {
+  controllerSettings.enabled = preferences.getBool("ctl_enabled", controllerSettings.enabled);
+  controllerSettings.allowNewConnections = preferences.getBool("ctl_pair", controllerSettings.allowNewConnections);
+  controllerSettings.ledR = preferences.getUChar("ctl_led_r", controllerSettings.ledR);
+  controllerSettings.ledG = preferences.getUChar("ctl_led_g", controllerSettings.ledG);
+  controllerSettings.ledB = preferences.getUChar("ctl_led_b", controllerSettings.ledB);
+  controllerSettings.rumbleForce = preferences.getUChar("ctl_r_force", controllerSettings.rumbleForce);
+  controllerSettings.rumbleDuration = preferences.getUChar("ctl_r_dur", controllerSettings.rumbleDuration);
+}
+
+void loadWifiSettings() {
+  wifiSettings.staSsid = preferences.getString("wifi_sta_ssid", wifiSettings.staSsid);
+  wifiSettings.staPassword = preferences.getString("wifi_sta_pw", wifiSettings.staPassword);
+  wifiSettings.apSsid = preferences.getString("wifi_ap_ssid", wifiSettings.apSsid);
+  wifiSettings.apPassword = preferences.getString("wifi_ap_pw", wifiSettings.apPassword);
+  wifiSettings.hostname = preferences.getString("wifi_host", wifiSettings.hostname);
+  if (wifiSettings.apSsid.length() == 0) {
+    wifiSettings.apSsid = DEFAULT_AP_SSID;
+  }
+  if (wifiSettings.apPassword.length() < 8) {
+    wifiSettings.apPassword = DEFAULT_AP_PASSWORD;
+  }
+  if (wifiSettings.hostname.length() == 0) {
+    wifiSettings.hostname = DEFAULT_HOSTNAME;
+  }
+}
+
+void loadAllSettings() {
+  for (int i = 0; i < JOINT_COUNT; ++i) {
+    loadJointSettings(joints[i]);
+  }
+  loadControllerSettings();
+  loadWifiSettings();
+}
+
+void selectActiveController() {
+  activeController = nullptr;
+  connectedInfo = ConnectedControllerInfo();
+  for (int i = 0; i < BP32_MAX_GAMEPADS; ++i) {
+    if (connectedControllers[i] != nullptr && connectedControllers[i]->isConnected() && connectedControllers[i]->isGamepad()) {
+      activeController = connectedControllers[i];
+      connectedInfo.connected = true;
+      connectedInfo.modelName = activeController->getModelName();
+      connectedInfo.typeName = controllerTypeName(activeController->getModel());
+      ControllerProperties properties = activeController->getProperties();
+      connectedInfo.btAddress = formatBdAddress(properties.btaddr);
+      connectedInfo.battery = activeController->battery();
+      break;
+    }
+  }
+}
+
+void applyControllerFeedback() {
+  if (activeController == nullptr || !activeController->isConnected()) {
+    return;
+  }
+  activeController->setColorLED(controllerSettings.ledR, controllerSettings.ledG, controllerSettings.ledB);
+  if (controllerSettings.rumbleForce > 0 && controllerSettings.rumbleDuration > 0) {
+    activeController->setRumble(controllerSettings.rumbleForce, controllerSettings.rumbleDuration);
+  }
+}
+
+void onConnectedController(ControllerPtr ctl) {
+  for (int i = 0; i < BP32_MAX_GAMEPADS; ++i) {
+    if (connectedControllers[i] == nullptr) {
+      connectedControllers[i] = ctl;
+      break;
+    }
+  }
+  selectActiveController();
+  applyControllerFeedback();
+}
+
+void onDisconnectedController(ControllerPtr ctl) {
+  for (int i = 0; i < BP32_MAX_GAMEPADS; ++i) {
+    if (connectedControllers[i] == ctl) {
+      connectedControllers[i] = nullptr;
+      break;
+    }
+  }
+  selectActiveController();
+}
+
+void startControllerStack() {
+  BP32.setup(&onConnectedController, &onDisconnectedController);
+  BP32.enableNewBluetoothConnections(controllerSettings.allowNewConnections);
+  localBluetoothMac = formatBdAddress(BP32.localBdAddress());
+}
+
+void startWifi() {
+  WiFi.disconnect(true, true);
+  delay(200);
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.setHostname(wifiSettings.hostname.c_str());
+  WiFi.softAP(wifiSettings.apSsid.c_str(), wifiSettings.apPassword.c_str());
+  if (wifiSettings.staSsid.length() > 0) {
+    WiFi.begin(wifiSettings.staSsid.c_str(), wifiSettings.staPassword.c_str());
+    uint32_t start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_RETRY_MS) {
+      delay(250);
+    }
+  }
+  Serial.print("AP IP: ");
+  Serial.println(WiFi.softAPIP());
+  Serial.print("STA IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+int dpadValueX(ControllerPtr controller) {
+  if (controller == nullptr) {
+    return 0;
+  }
+  int direction = 0;
+  if (controller->dpad() & DPAD_RIGHT) direction += AXIS_MAX_MAGNITUDE;
+  if (controller->dpad() & DPAD_LEFT) direction -= AXIS_MAX_MAGNITUDE;
+  return direction;
+}
+
+int dpadValueY(ControllerPtr controller) {
+  if (controller == nullptr) {
+    return 0;
+  }
+  int direction = 0;
+  if (controller->dpad() & DPAD_UP) direction += AXIS_MAX_MAGNITUDE;
+  if (controller->dpad() & DPAD_DOWN) direction -= AXIS_MAX_MAGNITUDE;
+  return direction;
+}
+
+int getVelocity(int value, int maxMagnitude, bool invert = false) {
+  int magnitude = abs(value);
+  if (magnitude < ANALOG_DEADZONE || maxMagnitude <= ANALOG_DEADZONE) {
+    return 0;
+  }
+  int scaled = map(magnitude, ANALOG_DEADZONE, maxMagnitude, 1, 6);
+  int direction = (value > 0) ? 1 : -1;
+  return (invert ? -direction : direction) * scaled;
+}
+
+bool buttonPressed(uint8_t button) {
+  if (activeController == nullptr || !activeController->isConnected()) {
+    return false;
+  }
+  switch (button) {
+    case BTN_UP: return activeController->dpad() & DPAD_UP;
+    case BTN_DOWN: return activeController->dpad() & DPAD_DOWN;
+    case BTN_LEFT: return activeController->dpad() & DPAD_LEFT;
+    case BTN_RIGHT: return activeController->dpad() & DPAD_RIGHT;
+    case BTN_SQUARE: return activeController->x();
+    case BTN_CROSS: return activeController->a();
+    case BTN_CIRCLE: return activeController->b();
+    case BTN_TRIANGLE: return activeController->y();
+    case BTN_L1: return activeController->l1();
+    case BTN_R1: return activeController->r1();
+    case BTN_L2: return activeController->l2();
+    case BTN_R2: return activeController->r2();
+    case BTN_SHARE: return activeController->miscBack();
+    case BTN_OPTIONS: return activeController->miscHome();
+    case BTN_L3: return activeController->thumbL();
+    case BTN_R3: return activeController->thumbR();
+    case BTN_PS: return activeController->miscSystem();
+    case BTN_TOUCHPAD: return false;
+    default: return false;
+  }
+}
+
+int readAxisValue(uint8_t source) {
+  if (activeController == nullptr || !activeController->isConnected()) {
+    return 0;
+  }
+  switch (source) {
+    case AXIS_LX: return activeController->axisX();
+    case AXIS_LY: return -activeController->axisY();
+    case AXIS_RX: return activeController->axisRX();
+    case AXIS_RY: return -activeController->axisRY();
+    case AXIS_DPAD_X: return dpadValueX(activeController);
+    case AXIS_DPAD_Y: return dpadValueY(activeController);
+    case AXIS_TRIGGERS: return activeController->throttle() - activeController->brake();
+    default: return 0;
+  }
+}
+
+int jointIndexByName(const String& name) {
+  for (int i = 0; i < JOINT_COUNT; ++i) {
+    if (name.equalsIgnoreCase(joints[i].name)) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+String jointJson(const Joint& joint) {
+  String json = "{";
+  json += "\"name\":" + jsonQuote(joint.name);
+  json += ",\"pin\":" + String(joint.pin);
+  json += ",\"motor_type\":" + jsonQuote(motorTypeName(joint.motorType));
+  json += ",\"min_angle\":" + String(joint.minAngle);
+  json += ",\"max_angle\":" + String(joint.maxAngle);
+  json += ",\"home_angle\":" + String(joint.homeAngle);
+  json += ",\"step\":" + String(joint.step);
+  json += ",\"pulse_min\":" + String(joint.pulseMin);
+  json += ",\"pulse_max\":" + String(joint.pulseMax);
+  json += ",\"invert\":" + boolJson(joint.inverted);
+  json += ",\"position\":" + String(joint.position);
+  json += ",\"attached\":" + boolJson(joint.attached);
+  json += ",\"velocity\":" + String(joint.velocity);
+  json += ",\"control_mode\":" + jsonQuote(controlModeName(joint.controlMode));
+  json += ",\"axis_source\":" + jsonQuote(axisSourceName(joint.axisSource));
+  json += ",\"positive_button\":" + jsonQuote(buttonSourceName(joint.positiveButton));
+  json += ",\"negative_button\":" + jsonQuote(buttonSourceName(joint.negativeButton));
+  json += ",\"input_invert\":" + boolJson(joint.inputInvert);
+  json += "}";
+  return json;
+}
+
+String controllerJson() {
+  String json = "{";
+  json += "\"enabled\":" + boolJson(controllerSettings.enabled);
+  json += ",\"allow_new_connections\":" + boolJson(controllerSettings.allowNewConnections);
+  json += ",\"connected\":" + boolJson(connectedInfo.connected);
+  json += ",\"esp32_bt_mac\":" + jsonQuote(localBluetoothMac);
+  json += ",\"controller_name\":" + jsonQuote(connectedInfo.modelName);
+  json += ",\"controller_type\":" + jsonQuote(connectedInfo.typeName);
+  json += ",\"controller_bt_addr\":" + jsonQuote(connectedInfo.btAddress);
+  json += ",\"led_r\":" + String(controllerSettings.ledR);
+  json += ",\"led_g\":" + String(controllerSettings.ledG);
+  json += ",\"led_b\":" + String(controllerSettings.ledB);
+  json += ",\"rumble_force\":" + String(controllerSettings.rumbleForce);
+  json += ",\"rumble_duration\":" + String(controllerSettings.rumbleDuration);
+  json += ",\"battery\":" + String(connectedInfo.connected ? activeController->battery() : 0);
+  json += "}";
+  return json;
+}
+
+String wifiJson() {
+  String json = "{";
+  json += "\"hostname\":" + jsonQuote(wifiSettings.hostname);
+  json += ",\"ap_ssid\":" + jsonQuote(wifiSettings.apSsid);
+  json += ",\"ap_ip\":" + jsonQuote(WiFi.softAPIP().toString());
+  json += ",\"sta_ssid\":" + jsonQuote(wifiSettings.staSsid);
+  json += ",\"sta_connected\":" + boolJson(WiFi.status() == WL_CONNECTED);
+  json += ",\"sta_ip\":" + jsonQuote(WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "");
+  json += "}";
+  return json;
+}
+
+String fullStateJson() {
+  String json = "{\"ok\":true";
+  json += ",\"wifi\":" + wifiJson();
+  json += ",\"ps4\":" + controllerJson();
+  json += ",\"joints\":[";
+  for (int i = 0; i < JOINT_COUNT; ++i) {
+    if (i > 0) {
+      json += ",";
+    }
+    json += jointJson(joints[i]);
+  }
+  json += "]}";
+  return json;
+}
+
+bool setJointField(Joint& joint, const String& field, int value) {
+  if (field.equalsIgnoreCase("pin")) {
+    joint.pin = static_cast<uint8_t>(constrain(value, 0, 255));
+    attachJoint(joint, true);
+  } else if (field.equalsIgnoreCase("motor_type")) {
+    joint.motorType = constrain(value, MOTOR_POSITIONAL, MOTOR_CONTINUOUS);
+    if (joint.motorType == MOTOR_CONTINUOUS) {
+      joint.minAngle = -100;
+      joint.maxAngle = 100;
+      joint.homeAngle = 0;
+      joint.position = 0;
+    } else {
+      joint.minAngle = 0;
+      joint.maxAngle = 180;
+      joint.homeAngle = 90;
+      joint.position = 90;
+    }
+  } else if (field.equalsIgnoreCase("min")) {
+    joint.minAngle = constrain(value, joint.motorType == MOTOR_CONTINUOUS ? -100 : 0, joint.motorType == MOTOR_CONTINUOUS ? 100 : 180);
+    if (joint.minAngle > joint.maxAngle) {
+      joint.maxAngle = joint.minAngle;
+    }
+  } else if (field.equalsIgnoreCase("max")) {
+    joint.maxAngle = constrain(value, joint.motorType == MOTOR_CONTINUOUS ? -100 : 0, joint.motorType == MOTOR_CONTINUOUS ? 100 : 180);
+    if (joint.maxAngle < joint.minAngle) {
+      joint.minAngle = joint.maxAngle;
+    }
+  } else if (field.equalsIgnoreCase("home")) {
+    joint.homeAngle = value;
+  } else if (field.equalsIgnoreCase("step")) {
+    joint.step = max(1, value);
+  } else if (field.equalsIgnoreCase("pulse_min")) {
+    joint.pulseMin = max(100, value);
+    joint.pulseMax = max(joint.pulseMin + 100, joint.pulseMax);
+    attachJoint(joint, true);
+  } else if (field.equalsIgnoreCase("pulse_max")) {
+    joint.pulseMax = max(value, joint.pulseMin + 100);
+    attachJoint(joint, true);
+  } else if (field.equalsIgnoreCase("invert")) {
+    joint.inverted = value != 0;
+  } else if (field.equalsIgnoreCase("position")) {
+    joint.position = value;
+  } else {
+    return false;
+  }
+  joint.homeAngle = clampAngle(joint, joint.homeAngle);
+  joint.position = clampAngle(joint, joint.position);
+  writeJoint(joint, joint.position);
+  saveJointSettings(joint);
+  return true;
+}
+
+void updateControllerInputs() {
+  if (!controllerSettings.enabled || activeController == nullptr || !activeController->isConnected()) {
+    for (int i = 0; i < JOINT_COUNT; ++i) {
+      joints[i].velocity = 0;
+      if (joints[i].motorType == MOTOR_CONTINUOUS && joints[i].position != joints[i].homeAngle) {
+        writeJoint(joints[i], joints[i].homeAngle);
+      }
+    }
+    return;
+  }
+
+  connectedInfo.battery = activeController->battery();
+
+  for (int i = 0; i < JOINT_COUNT; ++i) {
+    Joint& joint = joints[i];
+    joint.velocity = 0;
+
+    if (joint.controlMode == CONTROL_AXIS) {
+      int axisValue = readAxisValue(joint.axisSource);
+      int maxMagnitude = (joint.axisSource == AXIS_TRIGGERS) ? TRIGGER_MAX_MAGNITUDE : AXIS_MAX_MAGNITUDE;
+      joint.velocity = 0;
+      writeJoint(joint, axisToCommand(joint, axisValue, maxMagnitude, joint.inputInvert));
+    } else if (joint.controlMode == CONTROL_BUTTONS) {
+      int direction = 0;
+      if (buttonPressed(joint.positiveButton)) direction += 1;
+      if (buttonPressed(joint.negativeButton)) direction -= 1;
+      int stepAmount = max(1, joint.step);
+      joint.velocity = joint.inputInvert ? (-direction * stepAmount) : (direction * stepAmount);
+    } else if (joint.motorType == MOTOR_CONTINUOUS && joint.position != joint.homeAngle) {
+      writeJoint(joint, joint.homeAngle);
+    }
+  }
+}
+
+void applyVelocityMotion() {
+  for (int i = 0; i < JOINT_COUNT; ++i) {
+    if (joints[i].velocity == 0) {
+      continue;
+    }
+    int requested = joints[i].position + joints[i].velocity;
+    if (i == GRIPPER) {
+      requested = constrain(requested, max(joints[i].minAngle, GRIPPER_MIN_LIMIT), min(joints[i].maxAngle, GRIPPER_MAX_LIMIT));
+    }
+    writeJoint(joints[i], requested);
+  }
+}
+
+void handleState() {
+  server.send(200, "application/json", fullStateJson());
+}
+
+void handleSystem() {
+  String cmd = server.arg("cmd");
+  if (cmd == "save") {
+    saveAllSettings();
+    sendOk();
+  } else if (cmd == "load") {
+    loadAllSettings();
+    BP32.enableNewBluetoothConnections(controllerSettings.allowNewConnections);
+    startWifi();
+    writeAllJoints();
+    applyControllerFeedback();
+    sendOk();
+  } else if (cmd == "home_all") {
+    for (int i = 0; i < JOINT_COUNT; ++i) {
+      writeJoint(joints[i], joints[i].homeAngle);
+    }
+    sendOk();
+  } else if (cmd == "reboot") {
+    rebootRequested = true;
+    sendOk();
+  } else {
+    sendError("unknown_system_command");
+  }
+}
+
+void handleJoint() {
+  int index = jointIndexByName(server.arg("joint"));
+  if (index < 0) {
+    sendError("unknown_joint");
+    return;
+  }
+  Joint& joint = joints[index];
+  String cmd = server.arg("cmd");
+  if (cmd == "move") {
+    writeJoint(joint, server.arg("value").toInt());
+    sendOk(jointJson(joint));
+  } else if (cmd == "nudge") {
+    writeJoint(joint, joint.position + server.arg("value").toInt());
+    sendOk(jointJson(joint));
+  } else if (cmd == "home") {
+    writeJoint(joint, joint.homeAngle);
+    sendOk(jointJson(joint));
+  } else if (cmd == "attach") {
+    attachJoint(joint, true);
+    writeJoint(joint, joint.position);
+    sendOk(jointJson(joint));
+  } else if (cmd == "detach") {
+    detachJoint(joint);
+    sendOk(jointJson(joint));
+  } else if (cmd == "apply") {
+    setJointField(joint, "pin", server.arg("pin").toInt());
+    setJointField(joint, "motor_type", server.arg("motor_type").toInt());
+    setJointField(joint, "min", server.arg("min").toInt());
+    setJointField(joint, "max", server.arg("max").toInt());
+    setJointField(joint, "home", server.arg("home").toInt());
+    setJointField(joint, "step", server.arg("step").toInt());
+    setJointField(joint, "pulse_min", server.arg("pulse_min").toInt());
+    setJointField(joint, "pulse_max", server.arg("pulse_max").toInt());
+    setJointField(joint, "invert", server.arg("invert").toInt());
+    joint.controlMode = constrain(server.arg("control_mode").toInt(), CONTROL_NONE, CONTROL_BUTTONS);
+    joint.axisSource = constrain(server.arg("axis_source").toInt(), AXIS_NONE, AXIS_TRIGGERS);
+    joint.positiveButton = constrain(server.arg("positive_button").toInt(), BTN_NONE, BTN_TOUCHPAD);
+    joint.negativeButton = constrain(server.arg("negative_button").toInt(), BTN_NONE, BTN_TOUCHPAD);
+    joint.inputInvert = server.arg("input_invert").toInt() != 0;
+    saveJointSettings(joint);
+    sendOk(jointJson(joint));
+  } else {
+    sendError("unknown_joint_command");
+  }
+}
+
+void handlePs4() {
+  String cmd = server.arg("cmd");
+  if (cmd == "enable") {
+    controllerSettings.enabled = server.arg("value").toInt() != 0;
+    saveControllerSettings();
+    sendOk(controllerJson());
+  } else if (cmd == "pair_mode") {
+    controllerSettings.allowNewConnections = server.arg("value").toInt() != 0;
+    BP32.enableNewBluetoothConnections(controllerSettings.allowNewConnections);
+    saveControllerSettings();
+    sendOk(controllerJson());
+  } else if (cmd == "forget") {
+    BP32.forgetBluetoothKeys();
+    sendOk(controllerJson());
+  } else if (cmd == "disconnect") {
+    if (activeController != nullptr && activeController->isConnected()) {
+      activeController->disconnect();
+    }
+    sendOk(controllerJson());
+  } else if (cmd == "led") {
+    controllerSettings.ledR = static_cast<uint8_t>(constrain(server.arg("r").toInt(), 0, 255));
+    controllerSettings.ledG = static_cast<uint8_t>(constrain(server.arg("g").toInt(), 0, 255));
+    controllerSettings.ledB = static_cast<uint8_t>(constrain(server.arg("b").toInt(), 0, 255));
+    saveControllerSettings();
+    applyControllerFeedback();
+    sendOk(controllerJson());
+  } else if (cmd == "rumble") {
+    controllerSettings.rumbleForce = static_cast<uint8_t>(constrain(server.arg("force").toInt(), 0, 255));
+    controllerSettings.rumbleDuration = static_cast<uint8_t>(constrain(server.arg("duration").toInt(), 0, 255));
+    saveControllerSettings();
+    applyControllerFeedback();
+    sendOk(controllerJson());
+  } else {
+    sendError("unknown_ps4_command");
+  }
+}
+
+void handleWifi() {
+  String cmd = server.arg("cmd");
+  if (cmd == "set") {
+    String hostname = server.arg("hostname");
+    String apSsid = server.arg("ap_ssid");
+    String apPassword = server.arg("ap_password");
+    if (hostname.length() > 0) {
+      wifiSettings.hostname = hostname;
+    }
+    if (apSsid.length() > 0) {
+      wifiSettings.apSsid = apSsid;
+    }
+    if (apPassword.length() >= 8) {
+      wifiSettings.apPassword = apPassword;
+    }
+    wifiSettings.staSsid = server.arg("sta_ssid");
+    if (server.hasArg("sta_password") && server.arg("sta_password").length() > 0) {
+      wifiSettings.staPassword = server.arg("sta_password");
+    }
+    saveWifiSettings();
+    wifiReconnectRequested = true;
+    sendOk(wifiJson());
+  } else if (cmd == "reconnect") {
+    wifiReconnectRequested = true;
+    sendOk(wifiJson());
+  } else {
+    sendError("unknown_wifi_command");
+  }
+}
+
+void handleRoot() {
+  String page;
+  page.reserve(2600);
+  page += "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>";
+  page += "<title>Robot Arm Setup</title>";
+  page += "<style>body{font-family:Arial,sans-serif;max-width:760px;margin:24px auto;padding:0 16px;background:#111;color:#eee}";
+  page += "input{width:100%;padding:12px;margin:8px 0 16px;border:1px solid #444;border-radius:8px;background:#1c1c1c;color:#fff}";
+  page += "button{padding:12px 16px;border:0;border-radius:8px;background:#2d6cdf;color:#fff;font-weight:600;width:100%}";
+  page += ".card{background:#1a1a1a;padding:20px;border-radius:14px;margin-bottom:18px}.muted{color:#bbb}.ok{color:#7bd88f}</style></head><body>";
+  page += "<div class='card'><h2>Robot Arm Setup</h2>";
+  page += "<p class='muted'>Connect the ESP32 to your home Wi-Fi here. After that, use the Streamlit dashboard from any device on the same network.</p>";
+  page += "<p><strong>Setup AP:</strong> " + htmlEscape(wifiSettings.apSsid) + " (" + WiFi.softAPIP().toString() + ")</p>";
+  page += "<p><strong>Controller pairing:</strong> Put the DualShock 4 in pairing mode with SHARE + PS while pairing mode is enabled in the dashboard.</p>";
+  page += "<p><strong>ESP32 Bluetooth MAC:</strong> " + htmlEscape(localBluetoothMac) + "</p>";
+  page += "<p><strong>Station status:</strong> ";
+  page += (WiFi.status() == WL_CONNECTED) ? "<span class='ok'>Connected</span>" : "Not connected";
+  page += "</p>";
+  if (WiFi.status() == WL_CONNECTED) {
+    page += "<p><strong>Station IP:</strong> " + WiFi.localIP().toString() + "</p>";
+  }
+  page += "</div>";
+  page += "<div class='card'><form method='get' action='/setup'>";
+  page += "<label>Home Wi-Fi SSID</label><input name='sta_ssid' value='" + htmlEscape(wifiSettings.staSsid) + "' placeholder='Your router SSID'>";
+  page += "<label>Home Wi-Fi Password</label><input name='sta_password' type='password' placeholder='Your router password'>";
+  page += "<label>Hostname</label><input name='hostname' value='" + htmlEscape(wifiSettings.hostname) + "' placeholder='robot-arm'>";
+  page += "<label>Setup AP SSID</label><input name='ap_ssid' value='" + htmlEscape(wifiSettings.apSsid) + "'>";
+  page += "<label>Setup AP Password</label><input name='ap_password' type='password' placeholder='At least 8 characters'>";
+  page += "<button type='submit'>Save and reconnect</button></form></div>";
+  page += "<div class='card'><p><strong>API:</strong> <a style='color:#8ab4ff' href='/api/state'>/api/state</a></p>";
+  page += "<p class='muted'>The dashboard also lets you enable pairing mode, inspect the connected controller, and map every motor input.</p></div>";
+  page += "</body></html>";
+  server.send(200, "text/html", page);
+}
+
+void handleSetupPage() {
+  if (server.hasArg("hostname") && server.arg("hostname").length() > 0) {
+    wifiSettings.hostname = server.arg("hostname");
+  }
+  if (server.hasArg("ap_ssid") && server.arg("ap_ssid").length() > 0) {
+    wifiSettings.apSsid = server.arg("ap_ssid");
+  }
+  if (server.hasArg("ap_password") && server.arg("ap_password").length() >= 8) {
+    wifiSettings.apPassword = server.arg("ap_password");
+  }
+  if (server.hasArg("sta_ssid")) {
+    wifiSettings.staSsid = server.arg("sta_ssid");
+  }
+  if (server.hasArg("sta_password") && server.arg("sta_password").length() > 0) {
+    wifiSettings.staPassword = server.arg("sta_password");
+  }
+  saveWifiSettings();
+  wifiReconnectRequested = true;
+
+  String page;
+  page.reserve(950);
+  page += "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>";
+  page += "<title>Saved</title><style>body{font-family:Arial,sans-serif;max-width:640px;margin:24px auto;padding:0 16px;background:#111;color:#eee}";
+  page += "a{color:#8ab4ff}.card{background:#1a1a1a;padding:20px;border-radius:14px}</style></head><body><div class='card'>";
+  page += "<h2>Wi-Fi settings saved</h2><p>The ESP32 is reconnecting now.</p>";
+  page += "<p><strong>Setup AP:</strong> " + htmlEscape(wifiSettings.apSsid) + "</p>";
+  page += "<p><strong>Home SSID:</strong> " + htmlEscape(wifiSettings.staSsid) + "</p>";
+  page += "<p>After a few seconds, reopen <a href='/'>the setup page</a> or check <a href='/api/state'>/api/state</a>.</p>";
+  page += "</div></body></html>";
+  server.send(200, "text/html", page);
+}
+
+void configureRoutes() {
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/setup", HTTP_GET, handleSetupPage);
+  server.on("/api/state", HTTP_GET, handleState);
+  server.on("/api/system", HTTP_GET, handleSystem);
+  server.on("/api/joint", HTTP_GET, handleJoint);
+  server.on("/api/ps4", HTTP_GET, handlePs4);
+  server.on("/api/wifi", HTTP_GET, handleWifi);
+  server.onNotFound([]() { sendError("not_found", 404); });
+}
+}  // namespace
+
+void setup() {
+  Serial.begin(SERIAL_BAUD);
+  delay(1000);
+
+  preferences.begin("robot-arm", false);
+  loadAllSettings();
+  startControllerStack();
+  startWifi();
+  writeAllJoints();
+  configureRoutes();
+  server.begin();
+
+  Serial.println("=== Robot Arm Wi-Fi Control Ready ===");
+  Serial.print("Connect Streamlit to: http://");
+  Serial.println(WiFi.softAPIP());
+  Serial.print("Bluetooth MAC: ");
+  Serial.println(localBluetoothMac);
+}
+
+void loop() {
+  BP32.update();
+  server.handleClient();
+
+  uint32_t now = millis();
+  if (now - lastControlTick >= CONTROL_INTERVAL_MS) {
+    lastControlTick = now;
+    updateControllerInputs();
+    applyVelocityMotion();
+  }
+
+  if (wifiReconnectRequested) {
+    wifiReconnectRequested = false;
+    startWifi();
+  }
+
+  if (rebootRequested) {
+    delay(250);
+    ESP.restart();
+  }
+}
