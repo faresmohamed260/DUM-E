@@ -1,3 +1,5 @@
+![DUM-E banner](./branding/banner-repo.svg)
+
 # DUM-E
 
 Dextral Utility Manipulator - Enhanced
@@ -15,9 +17,32 @@ DUM-E is an ESP32-based robot arm controller with:
 
 - `robot_arm.ino`: ESP32 firmware
 - `streamlit_app.py`: Streamlit control dashboard
+- `launcher.py`: Windows desktop launcher
+- `launcher.spec`: PyInstaller build spec for the Windows app bundle
+- `branding/`: logo, icon, banner, social card, and brand guide assets
 - `requirements.txt`: Python dashboard dependencies
 - `scripts/install_python_deps.ps1`: installs the Python dependencies
 - `scripts/install_bluepad32_core.ps1`: installs the Bluepad32 Arduino core with the Arduino CLI bundled with Arduino IDE
+- `scripts/build_launcher.ps1`: builds the Windows launcher bundle
+
+## Windows launcher
+
+Build the bundled Windows app:
+
+```powershell
+pwsh -ExecutionPolicy Bypass -File .\scripts\build_launcher.ps1
+```
+
+Output:
+
+- `dist\DUM-E Launcher\DUM-E Launcher.exe`
+
+The launcher can:
+
+- install / repair the `ESP32 + Bluepad32` core
+- detect COM ports
+- compile and flash the ESP32
+- launch the dashboard without manually running Streamlit commands
 
 ## Python setup
 
