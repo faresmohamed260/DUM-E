@@ -79,7 +79,14 @@ class ControllerState:
     led_b: int
     rumble_force: int
     rumble_duration: int
+    axis_deadzone: int
+    axis_center_lx: int
+    axis_center_ly: int
+    axis_center_rx: int
+    axis_center_ry: int
+    home_all_button: str
     battery: int
+    battery_raw: int
 
 
 @dataclass
@@ -145,7 +152,14 @@ def parse_controller_state(payload: dict) -> ControllerState:
         led_b=int(payload["led_b"]),
         rumble_force=int(payload["rumble_force"]),
         rumble_duration=int(payload["rumble_duration"]),
+        axis_deadzone=int(payload["axis_deadzone"]),
+        axis_center_lx=int(payload["axis_center_lx"]),
+        axis_center_ly=int(payload["axis_center_ly"]),
+        axis_center_rx=int(payload["axis_center_rx"]),
+        axis_center_ry=int(payload["axis_center_ry"]),
+        home_all_button=str(payload["home_all_button"]),
         battery=int(payload["battery"]),
+        battery_raw=int(payload["battery_raw"]),
     )
 
 
@@ -244,7 +258,7 @@ def controller_controls(base_url: str, controller: ControllerState) -> None:
         st.write(f"Pairing mode: `{controller.allow_new_connections}`")
     with info_mid:
         st.write(f"Connected: `{controller.connected}`")
-        st.write(f"Battery: `{controller.battery}`")
+        st.write(f"Battery: `{controller.battery}%`")
     with info_right:
         st.write(f"Controller: `{controller.controller_name or 'none'}`")
         st.write(f"Type / BT addr: `{controller.controller_type or 'unknown'}` / `{controller.controller_bt_addr or 'n/a'}`")
@@ -280,6 +294,21 @@ def controller_controls(base_url: str, controller: ControllerState) -> None:
     with danger_mid:
         st.info("Once paired, you can turn pairing mode off so only remembered controllers reconnect.")
 
+    home_left, home_mid = st.columns(2)
+    with home_left:
+        home_all_button = st.selectbox(
+            "Home all motors button",
+            BUTTON_OPTIONS,
+            index=option_index(BUTTON_OPTIONS, controller.home_all_button),
+            key="controller_home_all_button",
+            format_func=lambda item: item[0],
+        )
+        if st.button("Apply home-all button", use_container_width=True):
+            run_device_action(base_url, "/api/ps4", params={"cmd": "home_button", "value": home_all_button[1]}, refresh=True, rerun=True)
+    with home_mid:
+        st.write(f"Configured home-all button: `{controller.home_all_button}`")
+        st.caption("Pressing this button on the controller will send every joint to its configured home angle once per button press.")
+
     feedback_left, feedback_mid = st.columns(2)
     with feedback_left:
         st.write("Controller feedback")
@@ -293,6 +322,19 @@ def controller_controls(base_url: str, controller: ControllerState) -> None:
         rumble_duration = st.slider("Rumble duration", 0, 255, controller.rumble_duration)
         if st.button("Apply rumble", use_container_width=True):
             run_device_action(base_url, "/api/ps4", params={"cmd": "rumble", "force": rumble_force, "duration": rumble_duration}, refresh=True, rerun=True)
+
+    calibration_left, calibration_mid = st.columns(2)
+    with calibration_left:
+        axis_deadzone = st.slider("Stick deadzone", 0, 200, controller.axis_deadzone)
+        if st.button("Apply deadzone", use_container_width=True):
+            run_device_action(base_url, "/api/ps4", params={"cmd": "deadzone", "value": axis_deadzone}, refresh=True, rerun=True)
+    with calibration_mid:
+        st.write(
+            f"Centers: LX `{controller.axis_center_lx}` | LY `{controller.axis_center_ly}` | "
+            f"RX `{controller.axis_center_rx}` | RY `{controller.axis_center_ry}`"
+        )
+        if st.button("Capture stick centers", use_container_width=True):
+            run_device_action(base_url, "/api/ps4", params={"cmd": "calibrate_center"}, refresh=True, rerun=True)
 
 
 def joint_controls(base_url: str, joint: JointState) -> None:

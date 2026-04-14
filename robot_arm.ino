@@ -9,11 +9,9 @@ namespace {
 constexpr uint32_t SERIAL_BAUD = 115200;
 constexpr uint32_t CONTROL_INTERVAL_MS = 20;
 constexpr uint32_t WIFI_RETRY_MS = 12000;
-constexpr int ANALOG_DEADZONE = 24;
+constexpr int DEFAULT_ANALOG_DEADZONE = 48;
 constexpr int AXIS_MAX_MAGNITUDE = 512;
 constexpr int TRIGGER_MAX_MAGNITUDE = 1023;
-constexpr int GRIPPER_MIN_LIMIT = 20;
-constexpr int GRIPPER_MAX_LIMIT = 160;
 
 const char* DEFAULT_AP_SSID = "RobotArm-Setup";
 const char* DEFAULT_AP_PASSWORD = "robotarm123";
@@ -104,6 +102,13 @@ struct ControllerSettings {
   uint8_t ledB = 255;
   uint8_t rumbleForce = 0;
   uint8_t rumbleDuration = 0;
+  int axisCenterLX = 0;
+  int axisCenterLY = 0;
+  int axisCenterRX = 0;
+  int axisCenterRY = 0;
+  int axisDeadzone = DEFAULT_ANALOG_DEADZONE;
+  uint8_t homeAllButton = BTN_NONE;
+  bool homeAllLatched = false;
 };
 
 struct WifiSettings {
@@ -290,12 +295,12 @@ int axisToCommand(const Joint& joint, int value, int maxMagnitude, bool invertIn
   int signedValue = invertInput ? -value : value;
   int clamped = constrain(signedValue, -maxMagnitude, maxMagnitude);
   if (joint.motorType == MOTOR_CONTINUOUS) {
-    if (abs(clamped) < ANALOG_DEADZONE) {
+    if (abs(clamped) < controllerSettings.axisDeadzone) {
       return 0;
     }
     return map(clamped, -maxMagnitude, maxMagnitude, joint.minAngle, joint.maxAngle);
   }
-  int deadzoneApplied = abs(clamped) < ANALOG_DEADZONE ? 0 : clamped;
+  int deadzoneApplied = abs(clamped) < controllerSettings.axisDeadzone ? 0 : clamped;
   return map(deadzoneApplied, -maxMagnitude, maxMagnitude, joint.minAngle, joint.maxAngle);
 }
 
@@ -362,6 +367,12 @@ void saveControllerSettings() {
   preferences.putUChar("ctl_led_b", controllerSettings.ledB);
   preferences.putUChar("ctl_r_force", controllerSettings.rumbleForce);
   preferences.putUChar("ctl_r_dur", controllerSettings.rumbleDuration);
+  preferences.putInt("ctl_c_lx", controllerSettings.axisCenterLX);
+  preferences.putInt("ctl_c_ly", controllerSettings.axisCenterLY);
+  preferences.putInt("ctl_c_rx", controllerSettings.axisCenterRX);
+  preferences.putInt("ctl_c_ry", controllerSettings.axisCenterRY);
+  preferences.putInt("ctl_dead", controllerSettings.axisDeadzone);
+  preferences.putUChar("ctl_home_btn", controllerSettings.homeAllButton);
 }
 
 void saveWifiSettings() {
@@ -429,6 +440,12 @@ void loadControllerSettings() {
   controllerSettings.ledB = preferences.getUChar("ctl_led_b", controllerSettings.ledB);
   controllerSettings.rumbleForce = preferences.getUChar("ctl_r_force", controllerSettings.rumbleForce);
   controllerSettings.rumbleDuration = preferences.getUChar("ctl_r_dur", controllerSettings.rumbleDuration);
+  controllerSettings.axisCenterLX = preferences.getInt("ctl_c_lx", controllerSettings.axisCenterLX);
+  controllerSettings.axisCenterLY = preferences.getInt("ctl_c_ly", controllerSettings.axisCenterLY);
+  controllerSettings.axisCenterRX = preferences.getInt("ctl_c_rx", controllerSettings.axisCenterRX);
+  controllerSettings.axisCenterRY = preferences.getInt("ctl_c_ry", controllerSettings.axisCenterRY);
+  controllerSettings.axisDeadzone = constrain(preferences.getInt("ctl_dead", controllerSettings.axisDeadzone), 0, 200);
+  controllerSettings.homeAllButton = constrain(preferences.getUChar("ctl_home_btn", controllerSettings.homeAllButton), BTN_NONE, BTN_TOUCHPAD);
 }
 
 void loadWifiSettings() {
@@ -551,10 +568,10 @@ int dpadValueY(ControllerPtr controller) {
 
 int getVelocity(int value, int maxMagnitude, bool invert = false) {
   int magnitude = abs(value);
-  if (magnitude < ANALOG_DEADZONE || maxMagnitude <= ANALOG_DEADZONE) {
+  if (magnitude < controllerSettings.axisDeadzone || maxMagnitude <= controllerSettings.axisDeadzone) {
     return 0;
   }
-  int scaled = map(magnitude, ANALOG_DEADZONE, maxMagnitude, 1, 6);
+  int scaled = map(magnitude, controllerSettings.axisDeadzone, maxMagnitude, 1, 6);
   int direction = (value > 0) ? 1 : -1;
   return (invert ? -direction : direction) * scaled;
 }
@@ -591,10 +608,10 @@ int readAxisValue(uint8_t source) {
     return 0;
   }
   switch (source) {
-    case AXIS_LX: return activeController->axisX();
-    case AXIS_LY: return -activeController->axisY();
-    case AXIS_RX: return activeController->axisRX();
-    case AXIS_RY: return -activeController->axisRY();
+    case AXIS_LX: return activeController->axisX() - controllerSettings.axisCenterLX;
+    case AXIS_LY: return -activeController->axisY() - controllerSettings.axisCenterLY;
+    case AXIS_RX: return activeController->axisRX() - controllerSettings.axisCenterRX;
+    case AXIS_RY: return -activeController->axisRY() - controllerSettings.axisCenterRY;
     case AXIS_DPAD_X: return dpadValueX(activeController);
     case AXIS_DPAD_Y: return dpadValueY(activeController);
     case AXIS_TRIGGERS: return activeController->throttle() - activeController->brake();
@@ -636,6 +653,13 @@ String jointJson(const Joint& joint) {
 }
 
 String controllerJson() {
+  int batteryRaw = connectedInfo.connected ? activeController->battery() : 0;
+  int batteryPercent = 0;
+  if (batteryRaw == 255) {
+    batteryPercent = 100;
+  } else if (batteryRaw > 1) {
+    batteryPercent = map(batteryRaw, 2, 254, 1, 99);
+  }
   String json = "{";
   json += "\"enabled\":" + boolJson(controllerSettings.enabled);
   json += ",\"allow_new_connections\":" + boolJson(controllerSettings.allowNewConnections);
@@ -649,7 +673,14 @@ String controllerJson() {
   json += ",\"led_b\":" + String(controllerSettings.ledB);
   json += ",\"rumble_force\":" + String(controllerSettings.rumbleForce);
   json += ",\"rumble_duration\":" + String(controllerSettings.rumbleDuration);
-  json += ",\"battery\":" + String(connectedInfo.connected ? activeController->battery() : 0);
+  json += ",\"axis_deadzone\":" + String(controllerSettings.axisDeadzone);
+  json += ",\"axis_center_lx\":" + String(controllerSettings.axisCenterLX);
+  json += ",\"axis_center_ly\":" + String(controllerSettings.axisCenterLY);
+  json += ",\"axis_center_rx\":" + String(controllerSettings.axisCenterRX);
+  json += ",\"axis_center_ry\":" + String(controllerSettings.axisCenterRY);
+  json += ",\"home_all_button\":" + jsonQuote(buttonSourceName(controllerSettings.homeAllButton));
+  json += ",\"battery\":" + String(batteryPercent);
+  json += ",\"battery_raw\":" + String(batteryRaw);
   json += "}";
   return json;
 }
@@ -741,10 +772,21 @@ void updateControllerInputs() {
         writeJoint(joints[i], joints[i].homeAngle);
       }
     }
+    controllerSettings.homeAllLatched = false;
     return;
   }
 
   connectedInfo.battery = activeController->battery();
+  bool homePressed = controllerSettings.homeAllButton != BTN_NONE && buttonPressed(controllerSettings.homeAllButton);
+  if (homePressed && !controllerSettings.homeAllLatched) {
+    for (int i = 0; i < JOINT_COUNT; ++i) {
+      joints[i].velocity = 0;
+      writeJoint(joints[i], joints[i].homeAngle);
+    }
+    controllerSettings.homeAllLatched = true;
+    return;
+  }
+  controllerSettings.homeAllLatched = homePressed;
 
   for (int i = 0; i < JOINT_COUNT; ++i) {
     Joint& joint = joints[i];
@@ -753,14 +795,22 @@ void updateControllerInputs() {
     if (joint.controlMode == CONTROL_AXIS) {
       int axisValue = readAxisValue(joint.axisSource);
       int maxMagnitude = (joint.axisSource == AXIS_TRIGGERS) ? TRIGGER_MAX_MAGNITUDE : AXIS_MAX_MAGNITUDE;
-      joint.velocity = 0;
-      writeJoint(joint, axisToCommand(joint, axisValue, maxMagnitude, joint.inputInvert));
+      if (joint.motorType == MOTOR_CONTINUOUS) {
+        writeJoint(joint, axisToCommand(joint, axisValue, maxMagnitude, joint.inputInvert));
+      } else {
+        joint.velocity = getVelocity(axisValue, maxMagnitude, joint.inputInvert);
+      }
     } else if (joint.controlMode == CONTROL_BUTTONS) {
       int direction = 0;
       if (buttonPressed(joint.positiveButton)) direction += 1;
       if (buttonPressed(joint.negativeButton)) direction -= 1;
       int stepAmount = max(1, joint.step);
-      joint.velocity = joint.inputInvert ? (-direction * stepAmount) : (direction * stepAmount);
+      if (joint.motorType == MOTOR_CONTINUOUS) {
+        int signedDirection = joint.inputInvert ? -direction : direction;
+        writeJoint(joint, signedDirection * stepAmount * 10);
+      } else {
+        joint.velocity = joint.inputInvert ? (-direction * stepAmount) : (direction * stepAmount);
+      }
     } else if (joint.motorType == MOTOR_CONTINUOUS && joint.position != joint.homeAngle) {
       writeJoint(joint, joint.homeAngle);
     }
@@ -773,9 +823,6 @@ void applyVelocityMotion() {
       continue;
     }
     int requested = joints[i].position + joints[i].velocity;
-    if (i == GRIPPER) {
-      requested = constrain(requested, max(joints[i].minAngle, GRIPPER_MIN_LIMIT), min(joints[i].maxAngle, GRIPPER_MAX_LIMIT));
-    }
     writeJoint(joints[i], requested);
   }
 }
@@ -886,6 +933,25 @@ void handlePs4() {
     controllerSettings.rumbleDuration = static_cast<uint8_t>(constrain(server.arg("duration").toInt(), 0, 255));
     saveControllerSettings();
     applyControllerFeedback();
+    sendOk(controllerJson());
+  } else if (cmd == "deadzone") {
+    controllerSettings.axisDeadzone = constrain(server.arg("value").toInt(), 0, 200);
+    saveControllerSettings();
+    sendOk(controllerJson());
+  } else if (cmd == "calibrate_center") {
+    if (activeController == nullptr || !activeController->isConnected()) {
+      sendError("no_controller_connected");
+      return;
+    }
+    controllerSettings.axisCenterLX = activeController->axisX();
+    controllerSettings.axisCenterLY = -activeController->axisY();
+    controllerSettings.axisCenterRX = activeController->axisRX();
+    controllerSettings.axisCenterRY = -activeController->axisRY();
+    saveControllerSettings();
+    sendOk(controllerJson());
+  } else if (cmd == "home_button") {
+    controllerSettings.homeAllButton = constrain(server.arg("value").toInt(), BTN_NONE, BTN_TOUCHPAD);
+    saveControllerSettings();
     sendOk(controllerJson());
   } else {
     sendError("unknown_ps4_command");
