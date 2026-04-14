@@ -1,9 +1,5 @@
 ![DUM-E banner](./branding/banner-repo.svg)
 
-# DUM-E
-
-Dextral Utility Manipulator - Enhanced
-
 ## Overview
 
 DUM-E is an ESP32-based robot arm controller with:
