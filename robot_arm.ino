@@ -1,6 +1,10 @@
 ﻿
 #include <Bluepad32.h>
 #include <ESP32Servo.h>
+#include <ESPmDNS.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
 #include <Preferences.h>
 #include <WebServer.h>
 #include <WiFi.h>
@@ -9,6 +13,10 @@ namespace {
 constexpr uint32_t SERIAL_BAUD = 115200;
 constexpr uint32_t CONTROL_INTERVAL_MS = 20;
 constexpr uint32_t WIFI_RETRY_MS = 12000;
+constexpr uint32_t WIFI_SERVICE_INTERVAL_MS = 100;
+constexpr const char* DEVICE_TYPE = "robot_arm";
+constexpr const char* DEVICE_MODEL = "DUM-E";
+constexpr const char* FIRMWARE_VERSION = "2026.04-discovery1";
 constexpr int DEFAULT_ANALOG_DEADZONE = 48;
 constexpr int AXIS_MAX_MAGNITUDE = 512;
 constexpr int TRIGGER_MAX_MAGNITUDE = 1023;
@@ -83,9 +91,19 @@ struct Joint {
   int step;
   int pulseMin;
   int pulseMax;
+  int neutralOutput;
+  int stopDeadband;
+  int maxSpeedScale;
   bool inverted;
   int position;
   int velocity;
+  int startupTarget;
+  int rawOutput;
+  int storedMinAngle;
+  int storedMaxAngle;
+  int storedHomeAngle;
+  int storedPosition;
+  bool manualContinuousControl;
   bool attached;
   uint8_t controlMode;
   uint8_t axisSource;
@@ -111,6 +129,23 @@ struct ControllerSettings {
   bool homeAllLatched = false;
 };
 
+enum ControllerWorkflowState : uint8_t {
+  CTL_DISABLED = 0,
+  CTL_IDLE = 1,
+  CTL_SCANNING = 2,
+  CTL_PAIRING = 3,
+  CTL_BONDED = 4,
+  CTL_RECONNECTING = 5,
+  CTL_CONNECTED = 6,
+  CTL_ERROR = 7,
+};
+
+struct ControllerIdentity {
+  String name = "";
+  String type = "";
+  String btAddress = "";
+};
+
 struct WifiSettings {
   String staSsid = "";
   String staPassword = "";
@@ -128,12 +163,12 @@ struct ConnectedControllerInfo {
 };
 
 Joint joints[JOINT_COUNT] = {
-  {"base",         "bas", Servo(), 18, MOTOR_POSITIONAL, 0,   180, 90, 2, 500, 2400, false, 90, 0, false, CONTROL_AXIS, AXIS_LX, BTN_NONE, BTN_NONE, false},
-  {"shoulder",     "sho", Servo(), 19, MOTOR_POSITIONAL, 0,   180, 90, 2, 500, 2400, false, 90, 0, false, CONTROL_AXIS, AXIS_LY, BTN_NONE, BTN_NONE, true},
-  {"elbow",        "elb", Servo(), 23, MOTOR_POSITIONAL, 0,   180, 90, 2, 500, 2400, false, 90, 0, false, CONTROL_AXIS, AXIS_RX, BTN_NONE, BTN_NONE, false},
-  {"wrist_pitch",  "wpi", Servo(), 21, MOTOR_POSITIONAL, 0,   180, 90, 2, 500, 2400, false, 90, 0, false, CONTROL_AXIS, AXIS_RY, BTN_NONE, BTN_NONE, true},
-  {"wrist_rotate", "wro", Servo(), 22, MOTOR_POSITIONAL, 0,   180, 90, 2, 500, 2400, false, 90, 0, false, CONTROL_BUTTONS, AXIS_NONE, BTN_UP, BTN_DOWN, false},
-  {"gripper",      "gri", Servo(), 25, MOTOR_POSITIONAL, 20,  160, 90, 2, 500, 2400, false, 90, 0, false, CONTROL_BUTTONS, AXIS_NONE, BTN_CIRCLE, BTN_CROSS, false},
+  {"base",         "bas", Servo(), 18, MOTOR_POSITIONAL, 0,   180, 90, 2, 500, 2400, 90, 3, 100, false, 90, 0, 90, 90, 0, 180, 90, 90, false, false, CONTROL_AXIS, AXIS_LX, BTN_NONE, BTN_NONE, false},
+  {"shoulder",     "sho", Servo(), 19, MOTOR_POSITIONAL, 0,   180, 90, 2, 500, 2400, 90, 3, 100, false, 90, 0, 90, 90, 0, 180, 90, 90, false, false, CONTROL_AXIS, AXIS_LY, BTN_NONE, BTN_NONE, true},
+  {"elbow",        "elb", Servo(), 23, MOTOR_POSITIONAL, 0,   180, 90, 2, 500, 2400, 90, 3, 100, false, 90, 0, 90, 90, 0, 180, 90, 90, false, false, CONTROL_AXIS, AXIS_RX, BTN_NONE, BTN_NONE, false},
+  {"wrist_pitch",  "wpi", Servo(), 21, MOTOR_POSITIONAL, 0,   180, 90, 2, 500, 2400, 90, 3, 100, false, 90, 0, 90, 90, 0, 180, 90, 90, false, false, CONTROL_AXIS, AXIS_RY, BTN_NONE, BTN_NONE, true},
+  {"wrist_rotate", "wro", Servo(), 22, MOTOR_POSITIONAL, 0,   180, 90, 2, 500, 2400, 90, 3, 100, false, 90, 0, 90, 90, 0, 180, 90, 90, false, false, CONTROL_BUTTONS, AXIS_NONE, BTN_UP, BTN_DOWN, false},
+  {"gripper",      "gri", Servo(), 25, MOTOR_POSITIONAL, 20,  160, 90, 2, 500, 2400, 90, 3, 100, false, 90, 0, 90, 90, 20, 160, 90, 90, false, false, CONTROL_BUTTONS, AXIS_NONE, BTN_CIRCLE, BTN_CROSS, false},
 };
 
 Preferences preferences;
@@ -143,13 +178,44 @@ ConnectedControllerInfo connectedInfo;
 WebServer server(80);
 ControllerPtr connectedControllers[BP32_MAX_GAMEPADS];
 ControllerPtr activeController = nullptr;
+ControllerIdentity rememberedController;
 String localBluetoothMac = "";
+String lastWifiResult = "boot";
+String lastWifiFailure = "";
+String mdnsHostname = "";
+bool mdnsActive = false;
+ControllerWorkflowState controllerWorkflowState = CTL_IDLE;
+String controllerStatusText = "idle";
+String lastControllerError = "";
+uint32_t controllerStateSinceMs = 0;
+uint32_t controllerReconnectStartedMs = 0;
+uint32_t controllerPairingStartedMs = 0;
 uint32_t lastControlTick = 0;
+uint32_t wifiConnectStartedMs = 0;
+bool wifiConnectInProgress = false;
+SemaphoreHandle_t stateMutex = nullptr;
+TaskHandle_t controlTaskHandle = nullptr;
 bool wifiReconnectRequested = false;
 bool rebootRequested = false;
 
+void updateControllerInputs();
+void applyVelocityMotion();
+void serviceWifiConnection();
+
 String prefKey(const Joint& joint, const char* suffix) {
   return String(joint.key) + suffix;
+}
+
+void lockState() {
+  if (stateMutex != nullptr) {
+    xSemaphoreTakeRecursive(stateMutex, portMAX_DELAY);
+  }
+}
+
+void unlockState() {
+  if (stateMutex != nullptr) {
+    xSemaphoreGiveRecursive(stateMutex);
+  }
 }
 
 String jsonQuote(const String& value) {
@@ -201,6 +267,65 @@ String formatBdAddress(const uint8_t* addr) {
   return String(buffer);
 }
 
+String sanitizeMdnsHostname(const String& hostname) {
+  String value = hostname;
+  value.toLowerCase();
+  String sanitized;
+  sanitized.reserve(value.length());
+  bool previousDash = false;
+  for (int i = 0; i < value.length(); ++i) {
+    char c = value[i];
+    bool valid = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+    if (valid) {
+      sanitized += c;
+      previousDash = false;
+    } else if (!previousDash && sanitized.length() > 0) {
+      sanitized += '-';
+      previousDash = true;
+    }
+  }
+  while (sanitized.endsWith("-")) {
+    sanitized.remove(sanitized.length() - 1);
+  }
+  if (sanitized.length() == 0) {
+    sanitized = DEFAULT_HOSTNAME;
+  }
+  return sanitized;
+}
+
+String wifiStatusString(wl_status_t status) {
+  switch (status) {
+    case WL_CONNECTED: return "connected";
+    case WL_NO_SSID_AVAIL: return "no_ssid";
+    case WL_CONNECT_FAILED: return "connect_failed";
+    case WL_CONNECTION_LOST: return "connection_lost";
+    case WL_DISCONNECTED: return "disconnected";
+    case WL_IDLE_STATUS: return "idle";
+    default: return "unknown";
+  }
+}
+
+void stopMdns() {
+  if (mdnsActive) {
+    MDNS.end();
+    mdnsActive = false;
+  }
+}
+
+void startMdnsIfReady() {
+  stopMdns();
+  mdnsHostname = sanitizeMdnsHostname(wifiSettings.hostname);
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+  if (MDNS.begin(mdnsHostname.c_str())) {
+    MDNS.addService("http", "tcp", 80);
+    mdnsActive = true;
+  } else {
+    lastWifiFailure = "mdns_start_failed";
+  }
+}
+
 const char* controllerTypeName(int type) {
   switch (type) {
     case Controller::CONTROLLER_TYPE_PS4Controller: return "ps4";
@@ -216,6 +341,48 @@ const char* controllerTypeName(int type) {
   }
 }
 
+const char* controllerWorkflowStateName(ControllerWorkflowState state) {
+  switch (state) {
+    case CTL_DISABLED: return "disabled";
+    case CTL_IDLE: return "idle";
+    case CTL_SCANNING: return "scanning";
+    case CTL_PAIRING: return "pairing";
+    case CTL_BONDED: return "bonded";
+    case CTL_RECONNECTING: return "reconnecting";
+    case CTL_CONNECTED: return "connected";
+    case CTL_ERROR: return "error";
+    default: return "unknown";
+  }
+}
+
+void setControllerWorkflowState(ControllerWorkflowState state, const String& statusText) {
+  if (controllerWorkflowState != state || controllerStatusText != statusText) {
+    controllerWorkflowState = state;
+    controllerStatusText = statusText;
+    controllerStateSinceMs = millis();
+  }
+}
+
+void clearControllerError() {
+  lastControllerError = "";
+}
+
+void setControllerError(const String& errorText) {
+  lastControllerError = errorText;
+  setControllerWorkflowState(CTL_ERROR, errorText);
+}
+
+void saveRememberedController() {
+  preferences.putString("ctl_mem_name", rememberedController.name);
+  preferences.putString("ctl_mem_type", rememberedController.type);
+  preferences.putString("ctl_mem_addr", rememberedController.btAddress);
+}
+
+void forgetRememberedController() {
+  rememberedController = ControllerIdentity();
+  saveRememberedController();
+}
+
 const char* controlModeName(uint8_t value) {
   switch (value) {
     case CONTROL_AXIS: return "axis";
@@ -229,6 +396,10 @@ const char* motorTypeName(uint8_t value) {
     case MOTOR_CONTINUOUS: return "continuous_360";
     default: return "positional_180";
   }
+}
+
+const char* jointCoordinateSpaceName(const Joint& joint) {
+  return joint.motorType == MOTOR_CONTINUOUS ? "speed_percent" : "servo_angle_degrees";
 }
 
 const char* axisSourceName(uint8_t value) {
@@ -277,18 +448,64 @@ void sendError(const String& message, int code = 400) {
 }
 
 int clampAngle(const Joint& joint, int value) {
-  if (joint.motorType == MOTOR_CONTINUOUS) {
-    return constrain(value, joint.minAngle, joint.maxAngle);
-  }
   return constrain(value, joint.minAngle, joint.maxAngle);
 }
 
-int applyDirection(const Joint& joint, int value) {
+int logicalToRawOutput(const Joint& joint, int value) {
   if (joint.motorType == MOTOR_CONTINUOUS) {
     int speed = joint.inverted ? -value : value;
-    return map(speed, -100, 100, 0, 180);
+    speed = (speed * joint.maxSpeedScale) / 100;
+    speed = constrain(speed, -100, 100);
+    if (abs(speed) <= joint.stopDeadband) {
+      return constrain(joint.neutralOutput, 0, 180);
+    }
+    if (speed > 0) {
+      int start = min(180, joint.neutralOutput + 1);
+      return map(speed, joint.stopDeadband + 1, 100, start, 180);
+    }
+    int start = max(0, joint.neutralOutput - 1);
+    return map(speed, -joint.stopDeadband - 1, -100, start, 0);
   }
   return joint.inverted ? (180 - value) : value;
+}
+
+void normalizeJointConfig(Joint& joint) {
+  joint.motorType = constrain(joint.motorType, MOTOR_POSITIONAL, MOTOR_CONTINUOUS);
+  int commandMin = joint.motorType == MOTOR_CONTINUOUS ? -100 : 0;
+  int commandMax = joint.motorType == MOTOR_CONTINUOUS ? 100 : 180;
+  joint.minAngle = constrain(joint.minAngle, commandMin, commandMax);
+  joint.maxAngle = constrain(joint.maxAngle, commandMin, commandMax);
+  if (joint.maxAngle < joint.minAngle) {
+    int swap = joint.minAngle;
+    joint.minAngle = joint.maxAngle;
+    joint.maxAngle = swap;
+  }
+  if (joint.motorType == MOTOR_CONTINUOUS && joint.homeAngle == 90) {
+    joint.homeAngle = 0;
+  }
+  if (joint.motorType == MOTOR_CONTINUOUS) {
+    joint.minAngle = -100;
+    joint.maxAngle = 100;
+    joint.homeAngle = 0;
+  }
+  joint.homeAngle = clampAngle(joint, joint.homeAngle);
+  joint.position = clampAngle(joint, joint.position);
+  joint.startupTarget = clampAngle(joint, joint.homeAngle);
+  joint.velocity = 0;
+  if (joint.motorType != MOTOR_CONTINUOUS) {
+    joint.manualContinuousControl = false;
+  }
+  joint.step = max(1, joint.step);
+  joint.pulseMin = max(100, joint.pulseMin);
+  joint.pulseMax = max(joint.pulseMin + 100, joint.pulseMax);
+  joint.neutralOutput = constrain(joint.neutralOutput, 0, 180);
+  joint.stopDeadband = constrain(joint.stopDeadband, 0, 20);
+  joint.maxSpeedScale = constrain(joint.maxSpeedScale, 1, 100);
+  joint.controlMode = constrain(joint.controlMode, CONTROL_NONE, CONTROL_BUTTONS);
+  joint.axisSource = constrain(joint.axisSource, AXIS_NONE, AXIS_TRIGGERS);
+  joint.positiveButton = constrain(joint.positiveButton, BTN_NONE, BTN_TOUCHPAD);
+  joint.negativeButton = constrain(joint.negativeButton, BTN_NONE, BTN_TOUCHPAD);
+  joint.rawOutput = logicalToRawOutput(joint, joint.position);
 }
 
 int axisToCommand(const Joint& joint, int value, int maxMagnitude, bool invertInput) {
@@ -305,7 +522,9 @@ int axisToCommand(const Joint& joint, int value, int maxMagnitude, bool invertIn
 }
 
 void attachJoint(Joint& joint, bool reattach = false) {
+  lockState();
   if (joint.attached && !reattach) {
+    unlockState();
     return;
   }
   if (joint.attached && reattach) {
@@ -317,22 +536,29 @@ void attachJoint(Joint& joint, bool reattach = false) {
     joint.servo.attach(joint.pin, joint.pulseMin, joint.pulseMax);
     joint.attached = true;
   }
+  unlockState();
 }
 
 void detachJoint(Joint& joint) {
+  lockState();
   if (!joint.attached) {
+    unlockState();
     return;
   }
   joint.servo.detach();
   joint.attached = false;
+  unlockState();
 }
 
 void writeJoint(Joint& joint, int requestedPosition, bool forceAttach = true) {
+  lockState();
   joint.position = clampAngle(joint, requestedPosition);
+  joint.rawOutput = logicalToRawOutput(joint, joint.position);
   if (forceAttach) {
     attachJoint(joint);
-    joint.servo.write(applyDirection(joint, joint.position));
+    joint.servo.write(joint.rawOutput);
   }
+  unlockState();
 }
 
 void writeAllJoints() {
@@ -350,6 +576,9 @@ void saveJointSettings(const Joint& joint) {
   preferences.putInt(prefKey(joint, "_step").c_str(), joint.step);
   preferences.putInt(prefKey(joint, "_pmin").c_str(), joint.pulseMin);
   preferences.putInt(prefKey(joint, "_pmax").c_str(), joint.pulseMax);
+  preferences.putInt(prefKey(joint, "_neu").c_str(), joint.neutralOutput);
+  preferences.putInt(prefKey(joint, "_dead").c_str(), joint.stopDeadband);
+  preferences.putInt(prefKey(joint, "_scale").c_str(), joint.maxSpeedScale);
   preferences.putBool(prefKey(joint, "_inv").c_str(), joint.inverted);
   preferences.putInt(prefKey(joint, "_pos").c_str(), joint.position);
   preferences.putUChar(prefKey(joint, "_cm").c_str(), joint.controlMode);
@@ -373,6 +602,7 @@ void saveControllerSettings() {
   preferences.putInt("ctl_c_ry", controllerSettings.axisCenterRY);
   preferences.putInt("ctl_dead", controllerSettings.axisDeadzone);
   preferences.putUChar("ctl_home_btn", controllerSettings.homeAllButton);
+  saveRememberedController();
 }
 
 void saveWifiSettings() {
@@ -400,6 +630,9 @@ void loadJointSettings(Joint& joint) {
   joint.step = preferences.getInt(prefKey(joint, "_step").c_str(), joint.step);
   joint.pulseMin = preferences.getInt(prefKey(joint, "_pmin").c_str(), joint.pulseMin);
   joint.pulseMax = preferences.getInt(prefKey(joint, "_pmax").c_str(), joint.pulseMax);
+  joint.neutralOutput = preferences.getInt(prefKey(joint, "_neu").c_str(), joint.neutralOutput);
+  joint.stopDeadband = preferences.getInt(prefKey(joint, "_dead").c_str(), joint.stopDeadband);
+  joint.maxSpeedScale = preferences.getInt(prefKey(joint, "_scale").c_str(), joint.maxSpeedScale);
   joint.inverted = preferences.getBool(prefKey(joint, "_inv").c_str(), joint.inverted);
   joint.position = preferences.getInt(prefKey(joint, "_pos").c_str(), joint.position);
   joint.controlMode = preferences.getUChar(prefKey(joint, "_cm").c_str(), joint.controlMode);
@@ -407,29 +640,11 @@ void loadJointSettings(Joint& joint) {
   joint.positiveButton = preferences.getUChar(prefKey(joint, "_pb").c_str(), joint.positiveButton);
   joint.negativeButton = preferences.getUChar(prefKey(joint, "_nb").c_str(), joint.negativeButton);
   joint.inputInvert = preferences.getBool(prefKey(joint, "_iinv").c_str(), joint.inputInvert);
-
-  joint.motorType = constrain(joint.motorType, MOTOR_POSITIONAL, MOTOR_CONTINUOUS);
-  int commandMin = joint.motorType == MOTOR_CONTINUOUS ? -100 : 0;
-  int commandMax = joint.motorType == MOTOR_CONTINUOUS ? 100 : 180;
-  joint.minAngle = constrain(joint.minAngle, commandMin, commandMax);
-  joint.maxAngle = constrain(joint.maxAngle, commandMin, commandMax);
-  if (joint.maxAngle < joint.minAngle) {
-    int swap = joint.minAngle;
-    joint.minAngle = joint.maxAngle;
-    joint.maxAngle = swap;
-  }
-  if (joint.motorType == MOTOR_CONTINUOUS && joint.homeAngle == 90) {
-    joint.homeAngle = 0;
-  }
-  joint.homeAngle = clampAngle(joint, joint.homeAngle);
-  joint.position = clampAngle(joint, joint.position);
-  joint.step = max(1, joint.step);
-  joint.pulseMin = max(100, joint.pulseMin);
-  joint.pulseMax = max(joint.pulseMin + 100, joint.pulseMax);
-  joint.controlMode = constrain(joint.controlMode, CONTROL_NONE, CONTROL_BUTTONS);
-  joint.axisSource = constrain(joint.axisSource, AXIS_NONE, AXIS_TRIGGERS);
-  joint.positiveButton = constrain(joint.positiveButton, BTN_NONE, BTN_TOUCHPAD);
-  joint.negativeButton = constrain(joint.negativeButton, BTN_NONE, BTN_TOUCHPAD);
+  joint.storedMinAngle = joint.minAngle;
+  joint.storedMaxAngle = joint.maxAngle;
+  joint.storedHomeAngle = joint.homeAngle;
+  joint.storedPosition = joint.position;
+  normalizeJointConfig(joint);
 }
 
 void loadControllerSettings() {
@@ -446,6 +661,9 @@ void loadControllerSettings() {
   controllerSettings.axisCenterRY = preferences.getInt("ctl_c_ry", controllerSettings.axisCenterRY);
   controllerSettings.axisDeadzone = constrain(preferences.getInt("ctl_dead", controllerSettings.axisDeadzone), 0, 200);
   controllerSettings.homeAllButton = constrain(preferences.getUChar("ctl_home_btn", controllerSettings.homeAllButton), BTN_NONE, BTN_TOUCHPAD);
+  rememberedController.name = preferences.getString("ctl_mem_name", "");
+  rememberedController.type = preferences.getString("ctl_mem_type", "");
+  rememberedController.btAddress = preferences.getString("ctl_mem_addr", "");
 }
 
 void loadWifiSettings() {
@@ -474,6 +692,7 @@ void loadAllSettings() {
 }
 
 void selectActiveController() {
+  lockState();
   activeController = nullptr;
   connectedInfo = ConnectedControllerInfo();
   for (int i = 0; i < BP32_MAX_GAMEPADS; ++i) {
@@ -488,6 +707,74 @@ void selectActiveController() {
       break;
     }
   }
+  unlockState();
+}
+
+void refreshControllerWorkflowState() {
+  lockState();
+  if (!controllerSettings.enabled) {
+    setControllerWorkflowState(CTL_DISABLED, "controller input disabled");
+    unlockState();
+    return;
+  }
+  if (connectedInfo.connected) {
+    setControllerWorkflowState(CTL_CONNECTED, "controller connected");
+    unlockState();
+    return;
+  }
+  if (controllerSettings.allowNewConnections) {
+    uint32_t elapsed = controllerPairingStartedMs > 0 ? millis() - controllerPairingStartedMs : 0;
+    if (elapsed > 0 && elapsed < 2000) {
+      setControllerWorkflowState(CTL_PAIRING, "waiting for selected controller to connect");
+    } else {
+      setControllerWorkflowState(CTL_SCANNING, "pairing mode enabled; put the controller in pairing mode");
+    }
+    unlockState();
+    return;
+  }
+  if (rememberedController.btAddress.length() > 0) {
+    setControllerWorkflowState(CTL_RECONNECTING, "waiting for remembered controller to reconnect");
+    unlockState();
+    return;
+  }
+  setControllerWorkflowState(CTL_IDLE, "ready to pair a controller");
+  unlockState();
+}
+
+void initializeJointsForStartup() {
+  for (int i = 0; i < JOINT_COUNT; ++i) {
+    Joint& joint = joints[i];
+    normalizeJointConfig(joint);
+    joint.startupTarget = joint.motorType == MOTOR_CONTINUOUS ? 0 : joint.homeAngle;
+    joint.velocity = 0;
+    attachJoint(joint, true);
+    writeJoint(joint, joint.startupTarget, false);
+    joint.servo.write(joint.rawOutput);
+    joint.position = joint.startupTarget;
+  }
+}
+
+void controlTask(void* parameter) {
+  TickType_t lastWake = xTaskGetTickCount();
+  const TickType_t intervalTicks = pdMS_TO_TICKS(CONTROL_INTERVAL_MS);
+  for (;;) {
+    BP32.update();
+
+    if (!connectedInfo.connected) {
+      if (controllerSettings.allowNewConnections && controllerPairingStartedMs > 0 && millis() - controllerPairingStartedMs > 45000) {
+        lastControllerError = "pairing_timeout";
+      } else if (!controllerSettings.allowNewConnections && rememberedController.btAddress.length() > 0 &&
+                 controllerReconnectStartedMs > 0 && millis() - controllerReconnectStartedMs > 15000 && lastControllerError.length() == 0) {
+        lastControllerError = "reconnect_timeout_turn_on_remembered_controller";
+      }
+    }
+
+    refreshControllerWorkflowState();
+    updateControllerInputs();
+    applyVelocityMotion();
+    lastControlTick = millis();
+    vTaskDelayUntil(&lastWake, intervalTicks);
+  }
 }
 
 void applyControllerFeedback() {
@@ -501,6 +788,7 @@ void applyControllerFeedback() {
 }
 
 void onConnectedController(ControllerPtr ctl) {
+  lockState();
   for (int i = 0; i < BP32_MAX_GAMEPADS; ++i) {
     if (connectedControllers[i] == nullptr) {
       connectedControllers[i] = ctl;
@@ -508,10 +796,21 @@ void onConnectedController(ControllerPtr ctl) {
     }
   }
   selectActiveController();
+  if (connectedInfo.connected) {
+    rememberedController.name = connectedInfo.modelName;
+    rememberedController.type = connectedInfo.typeName;
+    rememberedController.btAddress = connectedInfo.btAddress;
+    saveRememberedController();
+    controllerReconnectStartedMs = 0;
+    clearControllerError();
+    setControllerWorkflowState(CTL_CONNECTED, "controller connected");
+  }
+  unlockState();
   applyControllerFeedback();
 }
 
 void onDisconnectedController(ControllerPtr ctl) {
+  lockState();
   for (int i = 0; i < BP32_MAX_GAMEPADS; ++i) {
     if (connectedControllers[i] == ctl) {
       connectedControllers[i] = nullptr;
@@ -519,31 +818,70 @@ void onDisconnectedController(ControllerPtr ctl) {
     }
   }
   selectActiveController();
+  if (controllerSettings.enabled && rememberedController.btAddress.length() > 0 && !controllerSettings.allowNewConnections) {
+    controllerReconnectStartedMs = millis();
+  }
+  unlockState();
+  refreshControllerWorkflowState();
 }
 
 void startControllerStack() {
   BP32.setup(&onConnectedController, &onDisconnectedController);
   BP32.enableNewBluetoothConnections(controllerSettings.allowNewConnections);
   localBluetoothMac = formatBdAddress(BP32.localBdAddress());
+  controllerPairingStartedMs = controllerSettings.allowNewConnections ? millis() : 0;
+  controllerReconnectStartedMs = (!controllerSettings.allowNewConnections && rememberedController.btAddress.length() > 0) ? millis() : 0;
+  refreshControllerWorkflowState();
 }
 
 void startWifi() {
-  WiFi.disconnect(true, true);
+  stopMdns();
+  WiFi.disconnect(false, false);
   delay(200);
   WiFi.mode(WIFI_AP_STA);
   WiFi.setHostname(wifiSettings.hostname.c_str());
-  WiFi.softAP(wifiSettings.apSsid.c_str(), wifiSettings.apPassword.c_str());
+  bool apStarted = WiFi.softAP(wifiSettings.apSsid.c_str(), wifiSettings.apPassword.c_str());
+  lastWifiResult = apStarted ? "ap_started" : "ap_start_failed";
+  lastWifiFailure = apStarted ? "" : "ap_start_failed";
   if (wifiSettings.staSsid.length() > 0) {
     WiFi.begin(wifiSettings.staSsid.c_str(), wifiSettings.staPassword.c_str());
-    uint32_t start = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_RETRY_MS) {
-      delay(250);
-    }
+    wifiConnectStartedMs = millis();
+    wifiConnectInProgress = true;
+    lastWifiResult = "sta_connecting";
+    lastWifiFailure = "";
+  } else {
+    lastWifiResult = "sta_not_configured";
+    lastWifiFailure = "sta_not_configured";
+    wifiConnectInProgress = false;
   }
   Serial.print("AP IP: ");
   Serial.println(WiFi.softAPIP());
   Serial.print("STA IP: ");
   Serial.println(WiFi.localIP());
+  Serial.print("mDNS: ");
+  Serial.println(mdnsActive ? String(mdnsHostname + ".local") : String("inactive"));
+}
+
+void serviceWifiConnection() {
+  if (!wifiConnectInProgress) {
+    if (WiFi.status() == WL_CONNECTED && !mdnsActive) {
+      startMdnsIfReady();
+    }
+    return;
+  }
+  wl_status_t status = WiFi.status();
+  if (status == WL_CONNECTED) {
+    wifiConnectInProgress = false;
+    lastWifiResult = "sta_connected";
+    lastWifiFailure = "";
+    startMdnsIfReady();
+    return;
+  }
+  if (millis() - wifiConnectStartedMs >= WIFI_RETRY_MS) {
+    wifiConnectInProgress = false;
+    lastWifiResult = "sta_failed";
+    lastWifiFailure = wifiStatusString(status);
+  }
 }
 
 int dpadValueX(ControllerPtr controller) {
@@ -631,6 +969,7 @@ int jointIndexByName(const String& name) {
 String jointJson(const Joint& joint) {
   String json = "{";
   json += "\"name\":" + jsonQuote(joint.name);
+  json += ",\"coordinate_space\":" + jsonQuote(jointCoordinateSpaceName(joint));
   json += ",\"pin\":" + String(joint.pin);
   json += ",\"motor_type\":" + jsonQuote(motorTypeName(joint.motorType));
   json += ",\"min_angle\":" + String(joint.minAngle);
@@ -639,8 +978,17 @@ String jointJson(const Joint& joint) {
   json += ",\"step\":" + String(joint.step);
   json += ",\"pulse_min\":" + String(joint.pulseMin);
   json += ",\"pulse_max\":" + String(joint.pulseMax);
+  json += ",\"neutral_output\":" + String(joint.neutralOutput);
+  json += ",\"stop_deadband\":" + String(joint.stopDeadband);
+  json += ",\"max_speed_scale\":" + String(joint.maxSpeedScale);
   json += ",\"invert\":" + boolJson(joint.inverted);
   json += ",\"position\":" + String(joint.position);
+  json += ",\"startup_target\":" + String(joint.startupTarget);
+  json += ",\"raw_output\":" + String(joint.rawOutput);
+  json += ",\"stored_min_angle\":" + String(joint.storedMinAngle);
+  json += ",\"stored_max_angle\":" + String(joint.storedMaxAngle);
+  json += ",\"stored_home_angle\":" + String(joint.storedHomeAngle);
+  json += ",\"stored_position\":" + String(joint.storedPosition);
   json += ",\"attached\":" + boolJson(joint.attached);
   json += ",\"velocity\":" + String(joint.velocity);
   json += ",\"control_mode\":" + jsonQuote(controlModeName(joint.controlMode));
@@ -663,11 +1011,19 @@ String controllerJson() {
   String json = "{";
   json += "\"enabled\":" + boolJson(controllerSettings.enabled);
   json += ",\"allow_new_connections\":" + boolJson(controllerSettings.allowNewConnections);
+  json += ",\"state\":" + jsonQuote(controllerWorkflowStateName(controllerWorkflowState));
+  json += ",\"status_text\":" + jsonQuote(controllerStatusText);
+  json += ",\"last_error\":" + jsonQuote(lastControllerError);
+  json += ",\"scanning_in_progress\":" + boolJson(controllerWorkflowState == CTL_SCANNING || controllerWorkflowState == CTL_PAIRING);
+  json += ",\"reconnect_in_progress\":" + boolJson(controllerWorkflowState == CTL_RECONNECTING);
   json += ",\"connected\":" + boolJson(connectedInfo.connected);
   json += ",\"esp32_bt_mac\":" + jsonQuote(localBluetoothMac);
   json += ",\"controller_name\":" + jsonQuote(connectedInfo.modelName);
   json += ",\"controller_type\":" + jsonQuote(connectedInfo.typeName);
   json += ",\"controller_bt_addr\":" + jsonQuote(connectedInfo.btAddress);
+  json += ",\"remembered_name\":" + jsonQuote(rememberedController.name);
+  json += ",\"remembered_type\":" + jsonQuote(rememberedController.type);
+  json += ",\"remembered_bt_addr\":" + jsonQuote(rememberedController.btAddress);
   json += ",\"led_r\":" + String(controllerSettings.ledR);
   json += ",\"led_g\":" + String(controllerSettings.ledG);
   json += ",\"led_b\":" + String(controllerSettings.ledB);
@@ -686,13 +1042,35 @@ String controllerJson() {
 }
 
 String wifiJson() {
+  wl_status_t staStatus = WiFi.status();
   String json = "{";
   json += "\"hostname\":" + jsonQuote(wifiSettings.hostname);
+  json += ",\"mdns_hostname\":" + jsonQuote(mdnsHostname.length() > 0 ? mdnsHostname + ".local" : "");
+  json += ",\"mdns_active\":" + boolJson(mdnsActive);
+  json += ",\"ap_active\":" + boolJson(WiFi.getMode() == WIFI_AP || WiFi.getMode() == WIFI_AP_STA);
   json += ",\"ap_ssid\":" + jsonQuote(wifiSettings.apSsid);
   json += ",\"ap_ip\":" + jsonQuote(WiFi.softAPIP().toString());
   json += ",\"sta_ssid\":" + jsonQuote(wifiSettings.staSsid);
+  json += ",\"sta_connected\":" + boolJson(staStatus == WL_CONNECTED);
+  json += ",\"sta_ip\":" + jsonQuote(staStatus == WL_CONNECTED ? WiFi.localIP().toString() : "");
+  json += ",\"sta_status\":" + jsonQuote(wifiStatusString(staStatus));
+  json += ",\"last_result\":" + jsonQuote(lastWifiResult);
+  json += ",\"last_failure\":" + jsonQuote(lastWifiFailure);
+  json += "}";
+  return json;
+}
+
+String identifyJson() {
+  String json = "{\"ok\":true";
+  json += ",\"device_type\":" + jsonQuote(DEVICE_TYPE);
+  json += ",\"device_model\":" + jsonQuote(DEVICE_MODEL);
+  json += ",\"firmware_version\":" + jsonQuote(FIRMWARE_VERSION);
+  json += ",\"hostname\":" + jsonQuote(wifiSettings.hostname);
+  json += ",\"mdns_hostname\":" + jsonQuote(mdnsHostname.length() > 0 ? mdnsHostname + ".local" : "");
+  json += ",\"ip_address\":" + jsonQuote(WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : WiFi.softAPIP().toString());
+  json += ",\"ap_ip\":" + jsonQuote(WiFi.softAPIP().toString());
   json += ",\"sta_connected\":" + boolJson(WiFi.status() == WL_CONNECTED);
-  json += ",\"sta_ip\":" + jsonQuote(WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "");
+  json += ",\"mac\":" + jsonQuote(WiFi.macAddress());
   json += "}";
   return json;
 }
@@ -750,6 +1128,12 @@ bool setJointField(Joint& joint, const String& field, int value) {
   } else if (field.equalsIgnoreCase("pulse_max")) {
     joint.pulseMax = max(value, joint.pulseMin + 100);
     attachJoint(joint, true);
+  } else if (field.equalsIgnoreCase("neutral_output")) {
+    joint.neutralOutput = constrain(value, 0, 180);
+  } else if (field.equalsIgnoreCase("stop_deadband")) {
+    joint.stopDeadband = constrain(value, 0, 20);
+  } else if (field.equalsIgnoreCase("max_speed_scale")) {
+    joint.maxSpeedScale = constrain(value, 1, 100);
   } else if (field.equalsIgnoreCase("invert")) {
     joint.inverted = value != 0;
   } else if (field.equalsIgnoreCase("position")) {
@@ -757,22 +1141,23 @@ bool setJointField(Joint& joint, const String& field, int value) {
   } else {
     return false;
   }
-  joint.homeAngle = clampAngle(joint, joint.homeAngle);
-  joint.position = clampAngle(joint, joint.position);
+  normalizeJointConfig(joint);
   writeJoint(joint, joint.position);
   saveJointSettings(joint);
   return true;
 }
 
 void updateControllerInputs() {
+  lockState();
   if (!controllerSettings.enabled || activeController == nullptr || !activeController->isConnected()) {
     for (int i = 0; i < JOINT_COUNT; ++i) {
       joints[i].velocity = 0;
-      if (joints[i].motorType == MOTOR_CONTINUOUS && joints[i].position != joints[i].homeAngle) {
-        writeJoint(joints[i], joints[i].homeAngle);
+      if (joints[i].motorType == MOTOR_CONTINUOUS && !joints[i].manualContinuousControl && joints[i].position != joints[i].homeAngle) {
+        writeJoint(joints[i], 0, joints[i].attached);
       }
     }
     controllerSettings.homeAllLatched = false;
+    unlockState();
     return;
   }
 
@@ -781,9 +1166,11 @@ void updateControllerInputs() {
   if (homePressed && !controllerSettings.homeAllLatched) {
     for (int i = 0; i < JOINT_COUNT; ++i) {
       joints[i].velocity = 0;
-      writeJoint(joints[i], joints[i].homeAngle);
+      int homeTarget = joints[i].motorType == MOTOR_CONTINUOUS ? 0 : joints[i].homeAngle;
+      writeJoint(joints[i], homeTarget);
     }
     controllerSettings.homeAllLatched = true;
+    unlockState();
     return;
   }
   controllerSettings.homeAllLatched = homePressed;
@@ -796,7 +1183,8 @@ void updateControllerInputs() {
       int axisValue = readAxisValue(joint.axisSource);
       int maxMagnitude = (joint.axisSource == AXIS_TRIGGERS) ? TRIGGER_MAX_MAGNITUDE : AXIS_MAX_MAGNITUDE;
       if (joint.motorType == MOTOR_CONTINUOUS) {
-        writeJoint(joint, axisToCommand(joint, axisValue, maxMagnitude, joint.inputInvert));
+        joint.manualContinuousControl = false;
+        writeJoint(joint, axisToCommand(joint, axisValue, maxMagnitude, joint.inputInvert), joint.attached);
       } else {
         joint.velocity = getVelocity(axisValue, maxMagnitude, joint.inputInvert);
       }
@@ -807,28 +1195,42 @@ void updateControllerInputs() {
       int stepAmount = max(1, joint.step);
       if (joint.motorType == MOTOR_CONTINUOUS) {
         int signedDirection = joint.inputInvert ? -direction : direction;
-        writeJoint(joint, signedDirection * stepAmount * 10);
+        int requestedSpeed = signedDirection * stepAmount * 10;
+        if (direction == 0) {
+          requestedSpeed = 0;
+        }
+        joint.manualContinuousControl = false;
+        writeJoint(joint, requestedSpeed, joint.attached);
       } else {
         joint.velocity = joint.inputInvert ? (-direction * stepAmount) : (direction * stepAmount);
       }
-    } else if (joint.motorType == MOTOR_CONTINUOUS && joint.position != joint.homeAngle) {
-      writeJoint(joint, joint.homeAngle);
+    } else if (joint.motorType == MOTOR_CONTINUOUS && !joint.manualContinuousControl && joint.position != joint.homeAngle) {
+      writeJoint(joint, 0, joint.attached);
     }
   }
+  unlockState();
 }
 
 void applyVelocityMotion() {
+  lockState();
   for (int i = 0; i < JOINT_COUNT; ++i) {
     if (joints[i].velocity == 0) {
       continue;
     }
     int requested = joints[i].position + joints[i].velocity;
-    writeJoint(joints[i], requested);
+    writeJoint(joints[i], requested, joints[i].attached);
   }
+  unlockState();
 }
 
 void handleState() {
+  lockState();
   server.send(200, "application/json", fullStateJson());
+  unlockState();
+}
+
+void handleIdentify() {
+  server.send(200, "application/json", identifyJson());
 }
 
 void handleSystem() {
@@ -838,14 +1240,21 @@ void handleSystem() {
     sendOk();
   } else if (cmd == "load") {
     loadAllSettings();
+    initializeJointsForStartup();
     BP32.enableNewBluetoothConnections(controllerSettings.allowNewConnections);
     startWifi();
-    writeAllJoints();
     applyControllerFeedback();
     sendOk();
   } else if (cmd == "home_all") {
     for (int i = 0; i < JOINT_COUNT; ++i) {
-      writeJoint(joints[i], joints[i].homeAngle);
+      if (joints[i].motorType == MOTOR_CONTINUOUS) {
+        joints[i].manualContinuousControl = false;
+        writeJoint(joints[i], 0);
+        joints[i].startupTarget = 0;
+      } else {
+        writeJoint(joints[i], joints[i].homeAngle);
+        joints[i].startupTarget = joints[i].homeAngle;
+      }
     }
     sendOk();
   } else if (cmd == "reboot") {
@@ -865,13 +1274,22 @@ void handleJoint() {
   Joint& joint = joints[index];
   String cmd = server.arg("cmd");
   if (cmd == "move") {
+    if (joint.motorType == MOTOR_CONTINUOUS) {
+      joint.manualContinuousControl = true;
+    }
     writeJoint(joint, server.arg("value").toInt());
     sendOk(jointJson(joint));
   } else if (cmd == "nudge") {
+    if (joint.motorType == MOTOR_CONTINUOUS) {
+      joint.manualContinuousControl = true;
+    }
     writeJoint(joint, joint.position + server.arg("value").toInt());
     sendOk(jointJson(joint));
   } else if (cmd == "home") {
-    writeJoint(joint, joint.homeAngle);
+    int homeTarget = joint.motorType == MOTOR_CONTINUOUS ? 0 : joint.homeAngle;
+    joint.manualContinuousControl = joint.motorType == MOTOR_CONTINUOUS;
+    writeJoint(joint, homeTarget);
+    joint.startupTarget = homeTarget;
     sendOk(jointJson(joint));
   } else if (cmd == "attach") {
     attachJoint(joint, true);
@@ -889,6 +1307,9 @@ void handleJoint() {
     setJointField(joint, "step", server.arg("step").toInt());
     setJointField(joint, "pulse_min", server.arg("pulse_min").toInt());
     setJointField(joint, "pulse_max", server.arg("pulse_max").toInt());
+    setJointField(joint, "neutral_output", server.arg("neutral_output").toInt());
+    setJointField(joint, "stop_deadband", server.arg("stop_deadband").toInt());
+    setJointField(joint, "max_speed_scale", server.arg("max_speed_scale").toInt());
     setJointField(joint, "invert", server.arg("invert").toInt());
     joint.controlMode = constrain(server.arg("control_mode").toInt(), CONTROL_NONE, CONTROL_BUTTONS);
     joint.axisSource = constrain(server.arg("axis_source").toInt(), AXIS_NONE, AXIS_TRIGGERS);
@@ -906,20 +1327,62 @@ void handlePs4() {
   String cmd = server.arg("cmd");
   if (cmd == "enable") {
     controllerSettings.enabled = server.arg("value").toInt() != 0;
+    clearControllerError();
+    if (!controllerSettings.enabled) {
+      setControllerWorkflowState(CTL_DISABLED, "controller input disabled");
+    } else if (rememberedController.btAddress.length() > 0 && !controllerSettings.allowNewConnections) {
+      controllerReconnectStartedMs = millis();
+      setControllerWorkflowState(CTL_RECONNECTING, "waiting for remembered controller to reconnect");
+    } else {
+      refreshControllerWorkflowState();
+    }
     saveControllerSettings();
     sendOk(controllerJson());
   } else if (cmd == "pair_mode") {
     controllerSettings.allowNewConnections = server.arg("value").toInt() != 0;
     BP32.enableNewBluetoothConnections(controllerSettings.allowNewConnections);
+    clearControllerError();
+    controllerPairingStartedMs = controllerSettings.allowNewConnections ? millis() : 0;
+    controllerReconnectStartedMs = (!controllerSettings.allowNewConnections && rememberedController.btAddress.length() > 0) ? millis() : 0;
+    refreshControllerWorkflowState();
     saveControllerSettings();
+    sendOk(controllerJson());
+  } else if (cmd == "remember_current") {
+    if (activeController == nullptr || !activeController->isConnected()) {
+      sendError("no_controller_connected");
+      return;
+    }
+    rememberedController.name = connectedInfo.modelName;
+    rememberedController.type = connectedInfo.typeName;
+    rememberedController.btAddress = connectedInfo.btAddress;
+    saveRememberedController();
+    clearControllerError();
+    refreshControllerWorkflowState();
+    sendOk(controllerJson());
+  } else if (cmd == "forget_target") {
+    bool hadRemembered = rememberedController.btAddress.length() > 0;
+    forgetRememberedController();
+    clearControllerError();
+    if (!connectedInfo.connected) {
+      setControllerWorkflowState(CTL_IDLE, "ready to pair a controller");
+    } else {
+      refreshControllerWorkflowState();
+    }
+    if (!hadRemembered) {
+      lastControllerError = "no_remembered_controller";
+    }
     sendOk(controllerJson());
   } else if (cmd == "forget") {
     BP32.forgetBluetoothKeys();
+    forgetRememberedController();
+    clearControllerError();
+    setControllerWorkflowState(CTL_IDLE, "bluetooth bond data cleared");
     sendOk(controllerJson());
   } else if (cmd == "disconnect") {
     if (activeController != nullptr && activeController->isConnected()) {
       activeController->disconnect();
     }
+    refreshControllerWorkflowState();
     sendOk(controllerJson());
   } else if (cmd == "led") {
     controllerSettings.ledR = static_cast<uint8_t>(constrain(server.arg("r").toInt(), 0, 255));
@@ -940,6 +1403,7 @@ void handlePs4() {
     sendOk(controllerJson());
   } else if (cmd == "calibrate_center") {
     if (activeController == nullptr || !activeController->isConnected()) {
+      setControllerError("no_controller_connected");
       sendError("no_controller_connected");
       return;
     }
@@ -970,11 +1434,13 @@ void handleWifi() {
     if (apSsid.length() > 0) {
       wifiSettings.apSsid = apSsid;
     }
-    if (apPassword.length() >= 8) {
+    if (server.hasArg("ap_password") && apPassword.length() >= 8) {
       wifiSettings.apPassword = apPassword;
     }
-    wifiSettings.staSsid = server.arg("sta_ssid");
-    if (server.hasArg("sta_password") && server.arg("sta_password").length() > 0) {
+    if (server.hasArg("sta_ssid")) {
+      wifiSettings.staSsid = server.arg("sta_ssid");
+    }
+    if (server.hasArg("sta_password")) {
       wifiSettings.staPassword = server.arg("sta_password");
     }
     saveWifiSettings();
@@ -1007,6 +1473,7 @@ void handleRoot() {
   page += "</p>";
   if (WiFi.status() == WL_CONNECTED) {
     page += "<p><strong>Station IP:</strong> " + WiFi.localIP().toString() + "</p>";
+    page += "<p><strong>mDNS:</strong> " + htmlEscape(mdnsHostname + ".local") + "</p>";
   }
   page += "</div>";
   page += "<div class='card'><form method='get' action='/setup'>";
@@ -1017,6 +1484,7 @@ void handleRoot() {
   page += "<label>Setup AP Password</label><input name='ap_password' type='password' placeholder='At least 8 characters'>";
   page += "<button type='submit'>Save and reconnect</button></form></div>";
   page += "<div class='card'><p><strong>API:</strong> <a style='color:#8ab4ff' href='/api/state'>/api/state</a></p>";
+  page += "<p><strong>Identify:</strong> <a style='color:#8ab4ff' href='/api/identify'>/api/identify</a></p>";
   page += "<p class='muted'>The dashboard also lets you enable pairing mode, inspect the connected controller, and map every motor input.</p></div>";
   page += "</body></html>";
   server.send(200, "text/html", page);
@@ -1057,6 +1525,7 @@ void handleSetupPage() {
 void configureRoutes() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/setup", HTTP_GET, handleSetupPage);
+  server.on("/api/identify", HTTP_GET, handleIdentify);
   server.on("/api/state", HTTP_GET, handleState);
   server.on("/api/system", HTTP_GET, handleSystem);
   server.on("/api/joint", HTTP_GET, handleJoint);
@@ -1070,13 +1539,15 @@ void setup() {
   Serial.begin(SERIAL_BAUD);
   delay(1000);
 
+  stateMutex = xSemaphoreCreateRecursiveMutex();
   preferences.begin("robot-arm", false);
   loadAllSettings();
+  initializeJointsForStartup();
   startControllerStack();
   startWifi();
-  writeAllJoints();
   configureRoutes();
   server.begin();
+  xTaskCreatePinnedToCore(controlTask, "controlTask", 8192, nullptr, 3, &controlTaskHandle, 1);
 
   Serial.println("=== Robot Arm Wi-Fi Control Ready ===");
   Serial.print("Connect Streamlit to: http://");
@@ -1086,15 +1557,8 @@ void setup() {
 }
 
 void loop() {
-  BP32.update();
   server.handleClient();
-
-  uint32_t now = millis();
-  if (now - lastControlTick >= CONTROL_INTERVAL_MS) {
-    lastControlTick = now;
-    updateControllerInputs();
-    applyVelocityMotion();
-  }
+  serviceWifiConnection();
 
   if (wifiReconnectRequested) {
     wifiReconnectRequested = false;
@@ -1105,4 +1569,6 @@ void loop() {
     delay(250);
     ESP.restart();
   }
+
+  delay(1);
 }
