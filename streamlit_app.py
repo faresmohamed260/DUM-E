@@ -169,53 +169,16 @@ def asset_text(name: str) -> str:
 
 
 def render_brand_header() -> None:
-    st.markdown(
-        """
-        <style>
-        .dumebrand-shell {
-            padding: 1.2rem 1.2rem 0.8rem;
-            border: 1px solid rgba(57, 208, 199, 0.18);
-            border-radius: 28px;
-            background:
-                radial-gradient(circle at top right, rgba(57, 208, 199, 0.12), transparent 28%),
-                linear-gradient(180deg, rgba(19, 26, 35, 0.96), rgba(11, 16, 22, 0.98));
-            box-shadow: 0 20px 50px rgba(0, 0, 0, 0.26);
-            margin-bottom: 1rem;
-        }
-        .dumebrand-shell svg,
-        .dumebrand-sidebar svg {
-            width: 100%;
-            height: auto;
-            display: block;
-        }
-        .dumebrand-caption {
-            margin: 0.75rem 0 0;
-            color: #9BA7B8;
-            font-size: 0.98rem;
-        }
-        .dumebrand-sidebar {
-            margin: 0.25rem 0 1rem;
-            padding: 0.35rem 0.4rem 0;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-    st.markdown(
-        f"""
-        <div class="dumebrand-shell">
-            {asset_text("logo-horizontal.svg")}
-            <p class="dumebrand-caption">Wireless ESP32 calibration, deployment, and controller mapping for DUM-E.</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
+    st.image(
+        str(BRANDING_DIR / "logo-horizontal.svg"),
+        use_container_width=True,
     )
 
 
 def render_sidebar_brand() -> None:
-    st.sidebar.markdown(
-        f'<div class="dumebrand-sidebar">{asset_text("logo-mark.svg")}</div>',
-        unsafe_allow_html=True,
+    st.sidebar.image(
+        str(BRANDING_DIR / "logo-mark.svg"),
+        use_container_width=True,
     )
 
 

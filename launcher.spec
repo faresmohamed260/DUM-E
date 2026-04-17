@@ -1,9 +1,13 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from pathlib import Path
+
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules, copy_metadata
 
 datas = collect_data_files("streamlit")
+datas += collect_data_files("ttkbootstrap")
 datas += copy_metadata("streamlit")
+datas += copy_metadata("ttkbootstrap")
 datas += copy_metadata("requests")
 datas += copy_metadata("pyserial")
 datas += [
@@ -22,14 +26,20 @@ datas += [
 ]
 
 hiddenimports = collect_submodules("streamlit")
+hiddenimports += collect_submodules("ttkbootstrap")
 hiddenimports += [
     "serial.tools.list_ports",
 ]
 
+arduino_cli = Path(r"C:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe")
+binaries = []
+if arduino_cli.exists():
+    binaries.append((str(arduino_cli), "."))
+
 a = Analysis(
     ["launcher.py"],
     pathex=[],
-    binaries=[],
+    binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
@@ -44,8 +54,10 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
+    a.binaries,
+    a.datas,
     [],
-    exclude_binaries=True,
+    exclude_binaries=False,
     name="DUM-E Launcher",
     debug=False,
     bootloader_ignore_signals=False,
@@ -54,14 +66,5 @@ exe = EXE(
     console=False,
     disable_windowed_traceback=False,
     icon="branding\\icon-app.ico",
-)
-
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.datas,
-    strip=False,
-    upx=True,
-    upx_exclude=[],
-    name="DUM-E Launcher",
+    version=None,
 )

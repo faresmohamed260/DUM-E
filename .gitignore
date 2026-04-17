@@ -8,3 +8,5 @@ __pycache__/
 build/
 dist/
 dist-rebrand/
+device_cache.json
+.dume-portable/
