@@ -1,0 +1,10 @@
+{
+  "base_url": "http://192.168.1.132",
+  "safe_height_mm": 200,
+  "waypoint_delay_ms": 200,
+  "gripper_close_angle": 20,
+  "steps_per_segment": 6,
+  "arrival_tolerance_mm": 10,
+  "pick_position": [0.1, 0.0, 0.2],
+  "drop_position": [0.2, 0.1, 0.05]
+}

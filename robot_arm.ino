@@ -941,6 +941,113 @@ bool buttonPressed(uint8_t button) {
   }
 }
 
+String controllerInputsJson() {
+  int rawLX = 0;
+  int rawLY = 0;
+  int rawRX = 0;
+  int rawRY = 0;
+  int rawThrottle = 0;
+  int rawBrake = 0;
+  int centeredLX = 0;
+  int centeredLY = 0;
+  int centeredRX = 0;
+  int centeredRY = 0;
+  int triggerDifference = 0;
+  int dpadX = 0;
+  int dpadY = 0;
+
+  bool up = false;
+  bool down = false;
+  bool left = false;
+  bool right = false;
+  bool square = false;
+  bool cross = false;
+  bool circle = false;
+  bool triangle = false;
+  bool l1 = false;
+  bool r1 = false;
+  bool l2 = false;
+  bool r2 = false;
+  bool share = false;
+  bool options = false;
+  bool l3 = false;
+  bool r3 = false;
+  bool ps = false;
+  bool touchpad = false;
+
+  if (activeController != nullptr && activeController->isConnected()) {
+    rawLX = activeController->axisX();
+    rawLY = -activeController->axisY();
+    rawRX = activeController->axisRX();
+    rawRY = -activeController->axisRY();
+    rawThrottle = activeController->throttle();
+    rawBrake = activeController->brake();
+
+    centeredLX = rawLX - controllerSettings.axisCenterLX;
+    centeredLY = rawLY - controllerSettings.axisCenterLY;
+    centeredRX = rawRX - controllerSettings.axisCenterRX;
+    centeredRY = rawRY - controllerSettings.axisCenterRY;
+    triggerDifference = rawThrottle - rawBrake;
+
+    up = activeController->dpad() & DPAD_UP;
+    down = activeController->dpad() & DPAD_DOWN;
+    left = activeController->dpad() & DPAD_LEFT;
+    right = activeController->dpad() & DPAD_RIGHT;
+    dpadX = dpadValueX(activeController);
+    dpadY = dpadValueY(activeController);
+
+    square = activeController->x();
+    cross = activeController->a();
+    circle = activeController->b();
+    triangle = activeController->y();
+    l1 = activeController->l1();
+    r1 = activeController->r1();
+    l2 = activeController->l2();
+    r2 = activeController->r2();
+    share = activeController->miscBack();
+    options = activeController->miscHome();
+    l3 = activeController->thumbL();
+    r3 = activeController->thumbR();
+    ps = activeController->miscSystem();
+  }
+
+  String json = "{";
+  json += "\"raw_lx\":" + String(rawLX);
+  json += ",\"raw_ly\":" + String(rawLY);
+  json += ",\"raw_rx\":" + String(rawRX);
+  json += ",\"raw_ry\":" + String(rawRY);
+  json += ",\"centered_lx\":" + String(centeredLX);
+  json += ",\"centered_ly\":" + String(centeredLY);
+  json += ",\"centered_rx\":" + String(centeredRX);
+  json += ",\"centered_ry\":" + String(centeredRY);
+  json += ",\"raw_throttle\":" + String(rawThrottle);
+  json += ",\"raw_brake\":" + String(rawBrake);
+  json += ",\"trigger_difference\":" + String(triggerDifference);
+  json += ",\"dpad_x\":" + String(dpadX);
+  json += ",\"dpad_y\":" + String(dpadY);
+  json += ",\"buttons\":{";
+  json += "\"up\":" + boolJson(up);
+  json += ",\"down\":" + boolJson(down);
+  json += ",\"left\":" + boolJson(left);
+  json += ",\"right\":" + boolJson(right);
+  json += ",\"square\":" + boolJson(square);
+  json += ",\"cross\":" + boolJson(cross);
+  json += ",\"circle\":" + boolJson(circle);
+  json += ",\"triangle\":" + boolJson(triangle);
+  json += ",\"l1\":" + boolJson(l1);
+  json += ",\"r1\":" + boolJson(r1);
+  json += ",\"l2\":" + boolJson(l2);
+  json += ",\"r2\":" + boolJson(r2);
+  json += ",\"share\":" + boolJson(share);
+  json += ",\"options\":" + boolJson(options);
+  json += ",\"l3\":" + boolJson(l3);
+  json += ",\"r3\":" + boolJson(r3);
+  json += ",\"ps\":" + boolJson(ps);
+  json += ",\"touchpad\":" + boolJson(touchpad);
+  json += "}}";
+  return json;
+}
+
 int readAxisValue(uint8_t source) {
   if (activeController == nullptr || !activeController->isConnected()) {
     return 0;
@@ -1037,6 +1144,7 @@ String controllerJson() {
   json += ",\"home_all_button\":" + jsonQuote(buttonSourceName(controllerSettings.homeAllButton));
   json += ",\"battery\":" + String(batteryPercent);
   json += ",\"battery_raw\":" + String(batteryRaw);
+  json += ",\"inputs\":" + controllerInputsJson();
   json += "}";
   return json;
 }

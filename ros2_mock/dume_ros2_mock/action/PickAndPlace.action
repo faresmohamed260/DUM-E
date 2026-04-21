@@ -1,0 +1,10 @@
+# Goal
+geometry_msgs/Pose pick_pose
+geometry_msgs/Pose drop_pose
+---
+# Result
+bool success
+---
+# Feedback
+int32 distance
+int8 status

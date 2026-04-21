@@ -10,3 +10,7 @@ dist/
 dist-rebrand/
 device_cache.json
 .dume-portable/
+experiments/
+output/
+ros2_dashboard/runtime/
+ros2_dashboard/shared_profile.json

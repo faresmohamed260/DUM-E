@@ -3,6 +3,7 @@
 import ipaddress
 import json
 import socket
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,7 +12,9 @@ from urllib.parse import urlparse
 
 import requests
 import streamlit as st
-
+from ik_path import GRIPPER_ACTIONS, IK_JOINTS, CapturedIkPose, IkPathModule, IkPathPlan
+from sequence_live import LiveSequenceRecorder
+from sequence_module import DumeSequenceModule
 
 DEFAULT_DEVICE_URL = "http://192.168.4.1"
 DEFAULT_MDNS_HOSTNAME = "robot-arm.local"
@@ -52,9 +55,9 @@ MOTOR_TYPE_OPTIONS = [("positional_180", 0), ("continuous_360", 1)]
 APP_ROOT = Path(__file__).resolve().parent
 BRANDING_DIR = APP_ROOT / "branding"
 DEVICE_CACHE_PATH = APP_ROOT / "device_cache.json"
+ROS2_SHARED_PROFILE_PATH = APP_ROOT / "ros2_dashboard" / "shared_profile.json"
 DISCOVERY_TIMEOUT = 0.45
 DISCOVERY_WORKERS = 32
-
 
 @dataclass
 class JointState:
@@ -279,6 +282,51 @@ def sync_state(base_url: str) -> None:
     st.session_state.robot_state = fetch_state(base_url)
 
 
+def load_sequence_config(base_url: str) -> dict:
+    return {
+        "bridge": {
+            "device_base_url": normalize_base_url(base_url),
+            "dry_run": True,
+        },
+        "controller": {
+            "axis_deadzone": 48,
+        },
+    }
+
+
+def get_sequence_recorder(base_url: str) -> LiveSequenceRecorder:
+    normalized = normalize_base_url(base_url)
+    recorder = st.session_state.get("main_sequence_live_recorder")
+    recorder_url = st.session_state.get("main_sequence_live_recorder_url")
+    if recorder is None or recorder_url != normalized:
+        recorder = LiveSequenceRecorder(root=APP_ROOT, config=load_sequence_config(normalized))
+        st.session_state.main_sequence_live_recorder = recorder
+        st.session_state.main_sequence_live_recorder_url = normalized
+    return recorder
+
+
+def get_sequence_module(base_url: str) -> DumeSequenceModule:
+    normalized = normalize_base_url(base_url)
+    module = st.session_state.get("main_sequence_module")
+    module_url = st.session_state.get("main_sequence_module_url")
+    if module is None or module_url != normalized:
+        module = DumeSequenceModule(root=APP_ROOT, config=load_sequence_config(normalized))
+        st.session_state.main_sequence_module = module
+        st.session_state.main_sequence_module_url = normalized
+    return module
+
+
+def get_ik_path_module(base_url: str) -> IkPathModule:
+    normalized = normalize_base_url(base_url)
+    module = st.session_state.get("main_ik_path_module")
+    module_url = st.session_state.get("main_ik_path_module_url")
+    if module is None or module_url != normalized:
+        module = IkPathModule(root=APP_ROOT, base_url=normalized)
+        st.session_state.main_ik_path_module = module
+        st.session_state.main_ik_path_module_url = normalized
+    return module
+
+
 def normalize_base_url(value: str) -> str:
     candidate = value.strip()
     if not candidate:
@@ -299,6 +347,40 @@ def local_cache() -> dict:
 
 def save_local_cache(data: dict) -> None:
     DEVICE_CACHE_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def export_ros2_shared_profile(*, base_url: str, plan: IkPathPlan, safe_height_mm: float, delay_after_ms: int, steps_per_segment: int) -> None:
+    payload = {
+        "base_url": normalize_base_url(base_url),
+        "safe_height_mm": float(safe_height_mm),
+        "waypoint_delay_ms": int(delay_after_ms),
+        "gripper_close_angle": int(plan.gripper_close_value or 20),
+        "steps_per_segment": int(steps_per_segment),
+        "arrival_tolerance_mm": 10,
+        "pick_position": [
+            round(float(plan.start_pose.cartesian_pose_mm["x"]) / 1000.0, 6),
+            round(float(plan.start_pose.cartesian_pose_mm["y"]) / 1000.0, 6),
+            round(float(plan.start_pose.cartesian_pose_mm["z"]) / 1000.0, 6),
+        ],
+        "drop_position": [
+            round(float(plan.end_pose.cartesian_pose_mm["x"]) / 1000.0, 6),
+            round(float(plan.end_pose.cartesian_pose_mm["y"]) / 1000.0, 6),
+            round(float(plan.end_pose.cartesian_pose_mm["z"]) / 1000.0, 6),
+        ],
+        "source": "streamlit_app.full_ik_path",
+        "exported_at": time.time(),
+        "ik_plan_name": plan.name,
+    }
+    ROS2_SHARED_PROFILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    ROS2_SHARED_PROFILE_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def is_captured_ik_pose(value: object) -> bool:
+    return hasattr(value, "servo_pose") and hasattr(value, "cartesian_pose_mm")
+
+
+def is_ik_path_plan(value: object) -> bool:
+    return hasattr(value, "name") and hasattr(value, "commands") and hasattr(value, "start_pose") and hasattr(value, "end_pose")
 
 
 def parse_device_info(base_url: str, payload: dict) -> DeviceInfo:
@@ -529,8 +611,308 @@ def render_connection_sidebar() -> str:
     return normalize_base_url(manual_default)
 
 
+def render_sequence_recorder_section(base_url: str) -> None:
+    recorder = get_sequence_recorder(base_url)
+    module = get_sequence_module(base_url)
+    snapshot = recorder.snapshot()
+
+    with st.expander("Sequence Recorder", expanded=False):
+        st.caption(
+            "Record controller-driven moves into a replayable sequence. "
+            "This uses live `/api/state` updates and `ps4.inputs` for more reliable 360-joint capture."
+        )
+
+        controls_left, controls_mid, controls_right = st.columns(3)
+        with controls_left:
+            session_name = st.text_input(
+                "Session name",
+                value=st.session_state.get("main_sequence_session_name", "test_sequence"),
+                key="main_sequence_session_name_input",
+            )
+            st.session_state.main_sequence_session_name = session_name
+            overwrite_existing = st.checkbox("Overwrite existing session file", value=False, key="main_sequence_overwrite")
+        with controls_mid:
+            start_clicked = st.button("Start Recording", use_container_width=True, disabled=snapshot.running, key="main_sequence_start")
+        with controls_right:
+            stop_clicked = st.button("Stop Recording", use_container_width=True, disabled=not snapshot.running, key="main_sequence_stop")
+
+        if start_clicked:
+            try:
+                session = recorder.start(session_name, overwrite_existing=overwrite_existing)
+                st.success(f"Recording started: {session.session_name}")
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+
+        if stop_clicked:
+            session = recorder.stop()
+            if session is not None:
+                st.success(f"Recording stopped: {session.session_name}")
+                st.rerun()
+
+        status_left, status_mid, status_right = st.columns(3)
+        with status_left:
+            st.metric("Recorder", "Running" if snapshot.running else "Idle")
+            st.write(f"DUM-E: `{snapshot.dume_base_url or normalize_base_url(base_url)}`")
+        with status_mid:
+            st.metric("Steps Recorded", snapshot.steps_recorded)
+            st.write(f"Controller connected: `{snapshot.controller_connected}`")
+        with status_right:
+            st.write(f"Included 360 joint: `{snapshot.included_continuous_joint or 'none'}`")
+            st.write(f"Excluded 360 joints: `{', '.join(snapshot.excluded_continuous_joints) or 'none'}`")
+
+        if snapshot.running:
+            st.info("Recording is active. Move DUM-E with the controller now.")
+        if snapshot.last_error:
+            st.error(f"Recorder issue: {snapshot.last_error}")
+
+        session_to_show = snapshot.session_name or st.session_state.get("main_sequence_session_name")
+        if session_to_show:
+            session_path = module.session_path(session_to_show)
+            if session_path.exists():
+                session_payload = json.loads(session_path.read_text(encoding="utf-8"))
+                steps = session_payload.get("steps", [])
+                if steps:
+                    st.dataframe(
+                        [
+                            {
+                                "index": index + 1,
+                                "kind": step.get("kind"),
+                                "joint": step.get("joint_name"),
+                                "target": step.get("target_value"),
+                                "speed": step.get("speed_percent"),
+                                "direction": step.get("direction"),
+                                "duration_ms": step.get("duration_ms"),
+                                "delay_after_ms": step.get("delay_after_ms"),
+                                "note": step.get("note"),
+                            }
+                            for index, step in enumerate(steps)
+                        ],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                else:
+                    st.caption("No steps recorded yet for this session.")
+
+                action_left, action_mid = st.columns(2)
+                with action_left:
+                    if st.button("Preview Replay", use_container_width=True, disabled=snapshot.running, key="main_sequence_preview_replay"):
+                        st.session_state.main_sequence_replay_result = module.replay(session_to_show, dry_run=True).to_dict()
+                    if st.button("Execute Replay", use_container_width=True, disabled=snapshot.running, key="main_sequence_execute_replay"):
+                        st.session_state.main_sequence_replay_result = module.replay(session_to_show, dry_run=False).to_dict()
+                with action_mid:
+                    if st.button("Preview Return Home", use_container_width=True, disabled=snapshot.running, key="main_sequence_preview_return"):
+                        st.session_state.main_sequence_return_result = module.return_home(session_to_show, dry_run=True).to_dict()
+                    if st.button("Execute Return Home", use_container_width=True, disabled=snapshot.running, key="main_sequence_execute_return"):
+                        st.session_state.main_sequence_return_result = module.return_home(session_to_show, dry_run=False).to_dict()
+
+                with st.expander("Session JSON", expanded=False):
+                    st.json(session_payload)
+
+        if "main_sequence_replay_result" in st.session_state:
+            with st.expander("Replay Result", expanded=False):
+                st.json(st.session_state.main_sequence_replay_result)
+
+        if "main_sequence_return_result" in st.session_state:
+            with st.expander("Return Home Result", expanded=False):
+                st.json(st.session_state.main_sequence_return_result)
+
+    if snapshot.running:
+        time.sleep(0.5)
+        st.rerun()
+
+
+def render_ik_path_section(base_url: str) -> None:
+    module = get_ik_path_module(base_url)
+
+    with st.expander("Full IK Path", expanded=False):
+        st.caption(
+            "Capture a manual `start` and `end` gripper position, then generate a Cartesian IK path using only `base`, `shoulder`, and `elbow`. "
+            "Optional safe-height waypoints help avoid platform collisions, and path building now rejects waypoints that dip into the platform footprint."
+        )
+
+        name_col, steps_col, delay_col, safe_col = st.columns(4)
+        with name_col:
+            plan_name = st.text_input(
+                "IK path name",
+                value=st.session_state.get("main_ik_path_name", "ik_path_1"),
+                key="main_ik_path_name_input",
+            )
+            st.session_state.main_ik_path_name = plan_name
+        with steps_col:
+            interpolation_steps = st.number_input("Steps per segment", min_value=2, max_value=80, value=10, step=1)
+        with delay_col:
+            delay_after_ms = st.number_input("Delay after each waypoint (ms)", min_value=0, max_value=3000, value=140, step=10)
+        with safe_col:
+            safe_height_mm = st.number_input("Safe travel height Z (mm)", min_value=0.0, max_value=500.0, value=120.0, step=5.0)
+
+        use_safe_height = st.checkbox("Use safe-height waypoint path", value=True, key="main_ik_use_safe_height")
+        grip_left, grip_mid, grip_right = st.columns(3)
+        with grip_left:
+            gripper_prepare_action = st.selectbox(
+                "Gripper before start move",
+                options=list(GRIPPER_ACTIONS),
+                index=list(GRIPPER_ACTIONS).index("open"),
+                key="main_ik_gripper_prepare_action",
+            )
+        with grip_mid:
+            gripper_action_after_start_delay = st.selectbox(
+                "Gripper after reaching start",
+                options=list(GRIPPER_ACTIONS),
+                index=list(GRIPPER_ACTIONS).index("close"),
+                key="main_ik_gripper_action_after_start_delay",
+            )
+        with grip_right:
+            gripper_action_at_end = st.selectbox(
+                "Gripper after reaching end",
+                options=list(GRIPPER_ACTIONS),
+                index=list(GRIPPER_ACTIONS).index("open"),
+                key="main_ik_gripper_action_end",
+            )
+        grip_cfg_left, grip_cfg_mid, grip_cfg_right = st.columns(3)
+        with grip_cfg_left:
+            gripper_start_delay_ms = st.number_input(
+                "Start grip delay (ms)",
+                min_value=0,
+                max_value=5000,
+                value=300,
+                step=50,
+                key="main_ik_gripper_start_delay_ms",
+            )
+        with grip_cfg_mid:
+            gripper_end_delay_ms = st.number_input(
+                "End release delay (ms)",
+                min_value=0,
+                max_value=5000,
+                value=0,
+                step=50,
+                key="main_ik_gripper_end_delay_ms",
+            )
+        with grip_cfg_right:
+            gripper_close_value = st.number_input(
+                "Gripper close angle",
+                min_value=0,
+                max_value=180,
+                value=20,
+                step=1,
+                key="main_ik_gripper_close_value",
+            )
+
+        capture_left, capture_mid, capture_right = st.columns(3)
+        with capture_left:
+            if st.button("Capture Start Pose", use_container_width=True, key="main_ik_capture_start"):
+                try:
+                    st.session_state.main_ik_start = module.capture_pose()
+                    st.success("Captured start pose.")
+                except Exception as exc:
+                    st.error(str(exc))
+        with capture_mid:
+            if st.button("Capture End Pose", use_container_width=True, key="main_ik_capture_end"):
+                try:
+                    st.session_state.main_ik_end = module.capture_pose()
+                    st.success("Captured end pose.")
+                except Exception as exc:
+                    st.error(str(exc))
+        with capture_right:
+            if st.button("Clear IK Poses", use_container_width=True, key="main_ik_clear"):
+                st.session_state.pop("main_ik_start", None)
+                st.session_state.pop("main_ik_end", None)
+                st.session_state.pop("main_ik_plan", None)
+                st.session_state.pop("main_ik_result", None)
+                st.rerun()
+
+        start_pose = st.session_state.get("main_ik_start")
+        end_pose = st.session_state.get("main_ik_end")
+
+        status_left, status_right = st.columns(2)
+        with status_left:
+            st.markdown("**Start pose**")
+            if is_captured_ik_pose(start_pose):
+                st.json({"servo": start_pose.servo_pose, "cartesian_mm": start_pose.cartesian_pose_mm})
+            else:
+                st.caption("Not captured yet.")
+        with status_right:
+            st.markdown("**End pose**")
+            if is_captured_ik_pose(end_pose):
+                st.json({"servo": end_pose.servo_pose, "cartesian_mm": end_pose.cartesian_pose_mm})
+            else:
+                st.caption("Not captured yet.")
+
+        if st.button("Build IK Path", use_container_width=True, key="main_ik_build"):
+            if not is_captured_ik_pose(start_pose) or not is_captured_ik_pose(end_pose):
+                st.error("Capture both start and end poses first.")
+            else:
+                try:
+                    plan = module.build_plan(
+                        plan_name,
+                        start_pose,
+                        end_pose,
+                        interpolation_steps=int(interpolation_steps),
+                        delay_after_ms=int(delay_after_ms),
+                        use_safe_height=bool(use_safe_height),
+                        safe_height_mm=float(safe_height_mm),
+                        gripper_prepare_action=gripper_prepare_action,
+                        gripper_action_after_start_delay=gripper_action_after_start_delay,
+                        gripper_action_at_end=gripper_action_at_end,
+                        gripper_start_delay_ms=int(gripper_start_delay_ms),
+                        gripper_end_delay_ms=int(gripper_end_delay_ms),
+                        gripper_close_value=int(gripper_close_value),
+                    )
+                    st.session_state.main_ik_plan = plan
+                    export_ros2_shared_profile(
+                        base_url=base_url,
+                        plan=plan,
+                        safe_height_mm=float(safe_height_mm),
+                        delay_after_ms=int(delay_after_ms),
+                        steps_per_segment=int(interpolation_steps),
+                    )
+                    st.success(f"Built IK path: {plan.name}")
+                except Exception as exc:
+                    st.error(str(exc))
+
+        plan = st.session_state.get("main_ik_plan")
+        if is_ik_path_plan(plan):
+            st.write(f"Path `{plan.name}` with `{len(plan.commands)}` solved IK waypoints across `{', '.join(IK_JOINTS)}`.")
+            st.caption(
+                f"Gripper: before start `{plan.gripper_prepare_action}`"
+                + (f" -> {plan.gripper_open_value}" if plan.gripper_prepare_action == "open" and plan.gripper_open_value is not None else "")
+                + (f" -> {plan.gripper_close_value}" if plan.gripper_prepare_action == "close" and plan.gripper_close_value is not None else "")
+                + f", after start `{plan.gripper_action_after_start_delay}` after {plan.gripper_start_delay_ms} ms"
+                + (f" -> {plan.gripper_open_value}" if plan.gripper_action_after_start_delay == "open" and plan.gripper_open_value is not None else "")
+                + (f" -> {plan.gripper_close_value}" if plan.gripper_action_after_start_delay == "close" and plan.gripper_close_value is not None else "")
+                + f", end `{plan.gripper_action_at_end}`"
+                + (f" -> {plan.gripper_open_value}" if plan.gripper_action_at_end == "open" and plan.gripper_open_value is not None else "")
+                + (f" -> {plan.gripper_close_value}" if plan.gripper_action_at_end == "close" and plan.gripper_close_value is not None else "")
+                + "."
+            )
+            st.dataframe(
+                [
+                    {
+                        "index": index + 1,
+                        "base": command["base"],
+                        "shoulder": command["shoulder"],
+                        "elbow": command["elbow"],
+                    }
+                    for index, command in enumerate(plan.commands)
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            execute_left, execute_mid = st.columns(2)
+            with execute_left:
+                if st.button("Preview IK Execution", use_container_width=True, key="main_ik_preview"):
+                    st.session_state.main_ik_result = module.execute_plan(plan, dry_run=True)
+            with execute_mid:
+                if st.button("Execute IK Path", use_container_width=True, key="main_ik_execute"):
+                    st.session_state.main_ik_result = module.execute_plan(plan, dry_run=False)
+
+        if "main_ik_result" in st.session_state:
+            with st.expander("IK Result", expanded=False):
+                st.json(st.session_state.main_ik_result)
+
+
 def wifi_controls(base_url: str, wifi: WifiState) -> None:
-    st.subheader("Wi-Fi")
     info_left, info_mid, info_right = st.columns(3)
     with info_left:
         st.write(f"AP SSID: `{wifi.ap_ssid}`")
@@ -587,7 +969,6 @@ def wifi_controls(base_url: str, wifi: WifiState) -> None:
 
 
 def controller_controls(base_url: str, controller: ControllerState) -> None:
-    st.subheader("Wireless Controller")
     status_left, status_mid, status_right = st.columns(3)
     with status_left:
         st.write(f"Subsystem: `{controller.state}`")
@@ -703,7 +1084,7 @@ def controller_controls(base_url: str, controller: ControllerState) -> None:
 
 
 def joint_controls(base_url: str, joint: JointState) -> None:
-    with st.expander(joint.name.replace("_", " ").title(), expanded=True):
+    with st.expander(joint.name.replace("_", " ").title(), expanded=False):
         is_continuous = joint.motor_type == "continuous_360"
 
         def clamp(value: int, low: int, high: int) -> int:
@@ -954,8 +1335,12 @@ def main() -> None:
         if st.button("Home all joints", use_container_width=True):
             run_device_action(device_url, "/api/system", params={"cmd": "home_all"}, refresh=True, rerun=True)
 
-    wifi_controls(device_url, state["wifi"])
-    controller_controls(device_url, state["controller"])
+    render_sequence_recorder_section(device_url)
+    render_ik_path_section(device_url)
+    with st.expander("Wi-Fi", expanded=False):
+        wifi_controls(device_url, state["wifi"])
+    with st.expander("Wireless Controller", expanded=False):
+        controller_controls(device_url, state["controller"])
     for joint_name in state["joints"]:
         joint_controls(device_url, state["joints"][joint_name])
 

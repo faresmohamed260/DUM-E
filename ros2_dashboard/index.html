@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>DUM-E ROS2 Control Panel</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <header class="hero">
+      <div>
+        <p class="eyebrow">Portable ROS2 Layer</p>
+        <h1>DUM-E ROS2 Presentation Panel</h1>
+        <p class="lead">
+          Launch the bundled ROS2 compatibility server, send assignment goals, watch live feedback,
+          and present the lab through a clean local dashboard while DUM-E still does the real work.
+        </p>
+      </div>
+      <div class="hero-actions">
+        <button class="primary" data-action="build_workspace">Prepare ROS2 Runtime</button>
+        <button class="secondary" id="clear-finished">Clear History</button>
+        <button class="secondary" id="stop-all">Stop All</button>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="column">
+        <article class="panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">Server</p>
+              <h2>ROS2 Action Server</h2>
+            </div>
+          </div>
+          <div class="form-card">
+            <label for="base-url">DUM-E base URL</label>
+            <input id="base-url" value="">
+            <label for="safe-height-mm">Safe travel height (mm)</label>
+            <input id="safe-height-mm" value="">
+            <label for="waypoint-delay-ms">Waypoint delay (ms)</label>
+            <input id="waypoint-delay-ms" value="">
+            <label for="gripper-close-angle">Gripper close angle</label>
+            <input id="gripper-close-angle" value="">
+            <label for="steps-per-segment">Steps per segment</label>
+            <input id="steps-per-segment" value="">
+            <label for="arrival-tolerance-mm">Arrival tolerance (mm)</label>
+            <input id="arrival-tolerance-mm" value="">
+            <button class="wide" data-action="ros2_server">Start ROS2 Server</button>
+          </div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">Goal</p>
+              <h2>Pick and Place Request</h2>
+            </div>
+          </div>
+          <div class="form-card">
+            <label for="pick-position">Pick position (meters)</label>
+            <input id="pick-position" value="">
+            <label for="drop-position">Drop position (meters)</label>
+            <input id="drop-position" value="">
+            <button class="wide" data-action="ros2_send_goal">Send Pick-and-Place Goal</button>
+          </div>
+        </article>
+      </section>
+
+      <section class="column">
+        <article class="panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">ROS2</p>
+              <h2>Live ROS2 Graph</h2>
+            </div>
+            <button class="secondary small" id="refresh-status">Refresh</button>
+          </div>
+          <div class="ros-grid">
+            <div class="ros-card">
+              <h3>Nodes</h3>
+              <ul id="node-list" class="mono-list"></ul>
+            </div>
+            <div class="ros-card">
+              <h3>Actions</h3>
+              <ul id="action-list" class="mono-list"></ul>
+            </div>
+            <div class="ros-card">
+              <h3>Topics</h3>
+              <ul id="topic-list" class="mono-list"></ul>
+            </div>
+          </div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">Runtime</p>
+              <h2>Process Status</h2>
+            </div>
+          </div>
+          <div id="status-list" class="status-list"></div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">Logs</p>
+              <h2>Live Output</h2>
+            </div>
+          </div>
+          <div class="log-picker">
+            <label for="log-select">Process log</label>
+            <select id="log-select"></select>
+          </div>
+          <pre id="log-view" class="log-view">No process selected yet.</pre>
+        </article>
+      </section>
+    </main>
+
+    <div id="toast" class="toast hidden"></div>
+    <script src="script.js"></script>
+  </body>
+</html>
