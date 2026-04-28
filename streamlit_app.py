@@ -56,8 +56,23 @@ APP_ROOT = Path(__file__).resolve().parent
 BRANDING_DIR = APP_ROOT / "branding"
 DEVICE_CACHE_PATH = APP_ROOT / "device_cache.json"
 ROS2_SHARED_PROFILE_PATH = APP_ROOT / "ros2_dashboard" / "shared_profile.json"
-DISCOVERY_TIMEOUT = 0.45
+DISCOVERY_TIMEOUT = 1.0
 DISCOVERY_WORKERS = 32
+
+
+def create_http_session() -> requests.Session:
+    session = requests.Session()
+    session.trust_env = False
+    session.headers.update(
+        {
+            "Connection": "close",
+            "User-Agent": "DUM-E-Dashboard/1.0",
+        }
+    )
+    return session
+
+
+HTTP_SESSION = create_http_session()
 
 @dataclass
 class JointState:
@@ -159,7 +174,7 @@ def option_index(options: List[tuple[str, int]], value: str) -> int:
 
 
 def api_get(base_url: str, path: str, params: dict | None = None) -> dict:
-    response = requests.get(f"{base_url.rstrip('/')}{path}", params=params, timeout=8)
+    response = HTTP_SESSION.get(f"{base_url.rstrip('/')}{path}", params=params, timeout=8)
     response.raise_for_status()
     payload = response.json()
     if not payload.get("ok", True):
@@ -336,6 +351,16 @@ def normalize_base_url(value: str) -> str:
     return candidate.rstrip("/")
 
 
+def canonical_device_base_url(base_url: str, payload: dict | None = None) -> str:
+    normalized = normalize_base_url(base_url)
+    if not payload:
+        return normalized
+    ip_address = str(payload.get("ip_address", "")).strip()
+    if ip_address:
+        return normalize_base_url(ip_address)
+    return normalized
+
+
 def local_cache() -> dict:
     if DEVICE_CACHE_PATH.exists():
         try:
@@ -384,8 +409,9 @@ def is_ik_path_plan(value: object) -> bool:
 
 
 def parse_device_info(base_url: str, payload: dict) -> DeviceInfo:
+    canonical_base_url = canonical_device_base_url(base_url, payload)
     return DeviceInfo(
-        base_url=normalize_base_url(base_url),
+        base_url=canonical_base_url,
         hostname=str(payload.get("hostname", "")),
         mdns_hostname=str(payload.get("mdns_hostname", "")),
         ip_address=str(payload.get("ip_address", "")),
@@ -401,7 +427,7 @@ def probe_device(base_url: str, timeout: float = DISCOVERY_TIMEOUT) -> DeviceInf
     if not candidate:
         return None
     try:
-        response = requests.get(f"{candidate}{IDENTIFY_PATH}", timeout=timeout)
+        response = HTTP_SESSION.get(f"{candidate}{IDENTIFY_PATH}", timeout=timeout)
         response.raise_for_status()
         payload = response.json()
         if not payload.get("ok", True):
@@ -516,22 +542,61 @@ def discover_devices() -> tuple[list[DeviceInfo], list[str]]:
     return dedupe_devices(results), log
 
 
+def format_request_exception(exc: Exception) -> str:
+    if isinstance(exc, requests.exceptions.ConnectTimeout):
+        return "connection timed out"
+    if isinstance(exc, requests.exceptions.ReadTimeout):
+        return "device responded too slowly"
+    if isinstance(exc, requests.exceptions.ConnectionError):
+        return "connection failed"
+    if isinstance(exc, requests.exceptions.HTTPError):
+        response = exc.response
+        if response is not None:
+            return f"HTTP {response.status_code}"
+        return "HTTP error"
+    if isinstance(exc, ValueError):
+        return "response was not valid JSON"
+    return str(exc)
+
+
+def diagnose_device_connection(base_url: str, original_error: Exception) -> str:
+    target = normalize_base_url(base_url)
+    details: list[str] = [f"Failed to connect to `{target}`: {format_request_exception(original_error)}."]
+    for path, timeout in [(IDENTIFY_PATH, 3), ("/api/state", 5)]:
+        try:
+            response = HTTP_SESSION.get(f"{target}{path}", timeout=timeout)
+            response.raise_for_status()
+            payload = response.json()
+            details.append(
+                f"`{path}` responded with HTTP {response.status_code}, ok={payload.get('ok', True)}, "
+                f"device_type={payload.get('device_type', 'n/a')}."
+            )
+        except Exception as exc:
+            details.append(f"`{path}` check failed: {format_request_exception(exc)}.")
+    local_ips = local_ipv4_addresses()
+    if local_ips:
+        details.append(f"Local IPv4 addresses: {', '.join(local_ips)}.")
+    details.append("Confirm this PC is on the same SSID/VLAN as the ESP and not on an isolated guest network.")
+    return " ".join(details)
+
+
 def connect_device(base_url: str, device: DeviceInfo | None = None) -> bool:
     target = normalize_base_url(base_url)
     try:
-        sync_state(target)
-        st.session_state.connected_base_url = target
-        st.session_state.device_url = target
-        st.session_state.pop("device_error", None)
         if device is None:
             device = probe_device(target, timeout=1.0)
+        resolved_target = device.base_url if device is not None else target
+        sync_state(resolved_target)
+        st.session_state.connected_base_url = resolved_target
+        st.session_state.device_url = resolved_target
+        st.session_state.pop("device_error", None)
         if device is not None:
-            cache_successful_device(target, device)
+            cache_successful_device(resolved_target, device)
         else:
-            cache_successful_device(target)
+            cache_successful_device(resolved_target)
         return True
     except Exception as exc:
-        st.session_state.device_error = str(exc)
+        st.session_state.device_error = diagnose_device_connection(target, exc)
         return False
 
 

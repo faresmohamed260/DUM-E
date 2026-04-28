@@ -14,7 +14,7 @@ from typing import Iterable
 
 DEFAULT_DUME_MDNS = "robot-arm.local"
 IDENTIFY_PATH = "/api/identify"
-DISCOVERY_TIMEOUT = 0.45
+DISCOVERY_TIMEOUT = 1.0
 DISCOVERY_WORKERS = 32
 
 
@@ -23,6 +23,9 @@ class ResolvedDumeEndpoint:
     base_url: str
     source: str
     identify_payload: dict | None = None
+
+
+NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def normalize_base_url(candidate: str | None) -> str | None:
@@ -34,6 +37,16 @@ def normalize_base_url(candidate: str | None) -> str | None:
     if "://" not in normalized:
         normalized = f"http://{normalized}"
     return normalized.rstrip("/")
+
+
+def canonical_device_base_url(candidate: str, payload: dict | None = None) -> str:
+    normalized = normalize_base_url(candidate) or ""
+    if not payload:
+        return normalized
+    ip_address = str(payload.get("ip_address", "")).strip()
+    if ip_address:
+        return normalize_base_url(ip_address) or normalized
+    return normalized
 
 
 def extract_host(candidate: str | None) -> str | None:
@@ -96,9 +109,9 @@ def probe_dume_device(base_url: str, timeout: float = DISCOVERY_TIMEOUT) -> Reso
     if not normalized:
         return None
     url = f"{normalized}{IDENTIFY_PATH}"
-    request = urllib.request.Request(url, method="GET")
+    request = urllib.request.Request(url, headers={"Connection": "close", "User-Agent": "DUM-E-Discovery/1.0"}, method="GET")
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with NO_PROXY_OPENER.open(request, timeout=timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except Exception:
         return None
@@ -106,7 +119,11 @@ def probe_dume_device(base_url: str, timeout: float = DISCOVERY_TIMEOUT) -> Reso
         return None
     if payload.get("device_type") != "robot_arm":
         return None
-    return ResolvedDumeEndpoint(base_url=normalized, source="probe", identify_payload=payload)
+    return ResolvedDumeEndpoint(
+        base_url=canonical_device_base_url(normalized, payload),
+        source="probe",
+        identify_payload=payload,
+    )
 
 
 def discover_dume_endpoint(config_base_url: str | None, repo_root: Path, *, allow_subnet_scan: bool = True) -> ResolvedDumeEndpoint | None:
